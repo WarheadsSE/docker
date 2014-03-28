@@ -2,12 +2,14 @@ package utils
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dotcloud/docker/dockerversion"
 	"index/suffixarray"
 	"io"
 	"io/ioutil"
@@ -23,10 +25,10 @@ import (
 	"time"
 )
 
-var (
-	IAMSTATIC bool   // whether or not Docker itself was compiled statically via ./hack/make.sh binary
-	INITSHA1  string // sha1sum of separate static dockerinit, if Docker itself was compiled dynamically via ./hack/make.sh dynbinary
-)
+type KeyValuePair struct {
+	Key   string
+	Value string
+}
 
 // A common interface to access the Fatal method of
 // both testing.B and testing.T.
@@ -37,7 +39,7 @@ type Fataler interface {
 // Go is a basic promise implementation: it wraps calls a function in a goroutine,
 // and returns a channel which will later return the function's return value.
 func Go(f func() error) chan error {
-	ch := make(chan error)
+	ch := make(chan error, 1)
 	go func() {
 		ch <- f()
 	}()
@@ -45,14 +47,12 @@ func Go(f func() error) chan error {
 }
 
 // Request a given URL and return an io.Reader
-func Download(url string) (*http.Response, error) {
-	var resp *http.Response
-	var err error
+func Download(url string) (resp *http.Response, err error) {
 	if resp, err = http.Get(url); err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, errors.New("Got HTTP status code >= 400: " + resp.Status)
+		return nil, fmt.Errorf("Got HTTP status code >= 400: %s", resp.Status)
 	}
 	return resp, nil
 }
@@ -162,14 +162,23 @@ func Trunc(s string, maxlen int) string {
 	return s[:maxlen]
 }
 
-// Figure out the absolute path of our own binary
+// Figure out the absolute path of our own binary (if it's still around).
 func SelfPath() string {
 	path, err := exec.LookPath(os.Args[0])
 	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		if execErr, ok := err.(*exec.Error); ok && os.IsNotExist(execErr.Err) {
+			return ""
+		}
 		panic(err)
 	}
 	path, err = filepath.Abs(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
 		panic(err)
 	}
 	return path
@@ -190,7 +199,13 @@ func dockerInitSha1(target string) string {
 }
 
 func isValidDockerInitPath(target string, selfPath string) bool { // target and selfPath should be absolute (InitPath and SelfPath already do this)
-	if IAMSTATIC {
+	if target == "" {
+		return false
+	}
+	if dockerversion.IAMSTATIC {
+		if selfPath == "" {
+			return false
+		}
 		if target == selfPath {
 			return true
 		}
@@ -204,7 +219,7 @@ func isValidDockerInitPath(target string, selfPath string) bool { // target and 
 		}
 		return os.SameFile(targetFileInfo, selfPathFileInfo)
 	}
-	return INITSHA1 != "" && dockerInitSha1(target) == INITSHA1
+	return dockerversion.INITSHA1 != "" && dockerInitSha1(target) == dockerversion.INITSHA1
 }
 
 // Figure out the path of our dockerinit (which may be SelfPath())
@@ -216,6 +231,7 @@ func DockerInitPath(localCopy string) string {
 	}
 	var possibleInits = []string{
 		localCopy,
+		dockerversion.INITPATH,
 		filepath.Join(filepath.Dir(selfPath), "dockerinit"),
 
 		// FHS 3.0 Draft: "/usr/libexec includes internal binaries that are not intended to be executed directly by users or shell scripts. Applications may use a single subdirectory under /usr/libexec."
@@ -229,6 +245,9 @@ func DockerInitPath(localCopy string) string {
 		"/usr/local/lib/docker/dockerinit",
 	}
 	for _, dockerInit := range possibleInits {
+		if dockerInit == "" {
+			continue
+		}
 		path, err := exec.LookPath(dockerInit)
 		if err == nil {
 			path, err = filepath.Abs(path)
@@ -401,6 +420,7 @@ func GetTotalUsedFds() int {
 // TruncIndex allows the retrieval of string identifiers by any of their unique prefixes.
 // This is used to retrieve image and container IDs by more convenient shorthand prefixes.
 type TruncIndex struct {
+	sync.RWMutex
 	index *suffixarray.Index
 	ids   map[string]bool
 	bytes []byte
@@ -415,6 +435,8 @@ func NewTruncIndex() *TruncIndex {
 }
 
 func (idx *TruncIndex) Add(id string) error {
+	idx.Lock()
+	defer idx.Unlock()
 	if strings.Contains(id, " ") {
 		return fmt.Errorf("Illegal character: ' '")
 	}
@@ -428,6 +450,8 @@ func (idx *TruncIndex) Add(id string) error {
 }
 
 func (idx *TruncIndex) Delete(id string) error {
+	idx.Lock()
+	defer idx.Unlock()
 	if _, exists := idx.ids[id]; !exists {
 		return fmt.Errorf("No such id: %s", id)
 	}
@@ -453,6 +477,8 @@ func (idx *TruncIndex) lookup(s string) (int, int, error) {
 }
 
 func (idx *TruncIndex) Get(s string) (string, error) {
+	idx.RLock()
+	defer idx.RUnlock()
 	before, after, err := idx.lookup(s)
 	//log.Printf("Get(%s) bytes=|%s| before=|%d| after=|%d|\n", s, idx.bytes, before, after)
 	if err != nil {
@@ -471,6 +497,34 @@ func TruncateID(id string) string {
 		shortLen = len(id)
 	}
 	return id[:shortLen]
+}
+
+// GenerateRandomID returns an unique id
+func GenerateRandomID() string {
+	for {
+		id := make([]byte, 32)
+		if _, err := io.ReadFull(rand.Reader, id); err != nil {
+			panic(err) // This shouldn't happen
+		}
+		value := hex.EncodeToString(id)
+		// if we try to parse the truncated for as an int and we don't have
+		// an error then the value is all numberic and causes issues when
+		// used as a hostname. ref #3869
+		if _, err := strconv.Atoi(TruncateID(value)); err == nil {
+			continue
+		}
+		return value
+	}
+}
+
+func ValidateID(id string) error {
+	if id == "" {
+		return fmt.Errorf("Id can't be empty")
+	}
+	if strings.Contains(id, ":") {
+		return fmt.Errorf("Invalid character in id: ':'")
+	}
+	return nil
 }
 
 // Code c/c from io.Copy() modified to handle escape sequence
@@ -532,15 +586,11 @@ type KernelVersionInfo struct {
 }
 
 func (k *KernelVersionInfo) String() string {
-	flavor := ""
-	if len(k.Flavor) > 0 {
-		flavor = fmt.Sprintf("-%s", k.Flavor)
-	}
-	return fmt.Sprintf("%d.%d.%d%s", k.Kernel, k.Major, k.Minor, flavor)
+	return fmt.Sprintf("%d.%d.%d%s", k.Kernel, k.Major, k.Minor, k.Flavor)
 }
 
 // Compare two KernelVersionInfo struct.
-// Returns -1 if a < b, = if a == b, 1 it a > b
+// Returns -1 if a < b, 0 if a == b, 1 it a > b
 func CompareKernelVersion(a, b *KernelVersionInfo) int {
 	if a.Kernel < b.Kernel {
 		return -1
@@ -561,28 +611,6 @@ func CompareKernelVersion(a, b *KernelVersionInfo) int {
 	}
 
 	return 0
-}
-
-func FindCgroupMountpoint(cgroupType string) (string, error) {
-	output, err := ioutil.ReadFile("/proc/mounts")
-	if err != nil {
-		return "", err
-	}
-
-	// /proc/mounts has 6 fields per line, one mount per line, e.g.
-	// cgroup /sys/fs/cgroup/devices cgroup rw,relatime,devices 0 0
-	for _, line := range strings.Split(string(output), "\n") {
-		parts := strings.Split(line, " ")
-		if len(parts) == 6 && parts[2] == "cgroup" {
-			for _, opt := range strings.Split(parts[3], ",") {
-				if opt == cgroupType {
-					return parts[1], nil
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("cgroup mountpoint not found for %s", cgroupType)
 }
 
 func GetKernelVersion() (*KernelVersionInfo, error) {
@@ -611,41 +639,21 @@ func GetKernelVersion() (*KernelVersionInfo, error) {
 
 func ParseRelease(release string) (*KernelVersionInfo, error) {
 	var (
-		flavor               string
-		kernel, major, minor int
-		err                  error
+		kernel, major, minor, parsed int
+		flavor, partial              string
 	)
 
-	tmp := strings.SplitN(release, "-", 2)
-	tmp2 := strings.Split(tmp[0], ".")
-
-	if len(tmp2) > 0 {
-		kernel, err = strconv.Atoi(tmp2[0])
-		if err != nil {
-			return nil, err
-		}
+	// Ignore error from Sscanf to allow an empty flavor.  Instead, just
+	// make sure we got all the version numbers.
+	parsed, _ = fmt.Sscanf(release, "%d.%d%s", &kernel, &major, &partial)
+	if parsed < 2 {
+		return nil, errors.New("Can't parse kernel version " + release)
 	}
 
-	if len(tmp2) > 1 {
-		major, err = strconv.Atoi(tmp2[1])
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if len(tmp2) > 2 {
-		// Removes "+" because git kernels might set it
-		minorUnparsed := strings.Trim(tmp2[2], "+")
-		minor, err = strconv.Atoi(minorUnparsed)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if len(tmp) == 2 {
-		flavor = tmp[1]
-	} else {
-		flavor = ""
+	// sometimes we have 3.12.25-gentoo, but sometimes we just have 3.12-1-amd64
+	parsed, _ = fmt.Sscanf(partial, ".%d%s", &minor, &flavor)
+	if parsed < 1 {
+		flavor = partial
 	}
 
 	return &KernelVersionInfo{
@@ -711,7 +719,7 @@ func IsURL(str string) bool {
 }
 
 func IsGIT(str string) bool {
-	return strings.HasPrefix(str, "git://") || strings.HasPrefix(str, "github.com/")
+	return strings.HasPrefix(str, "git://") || strings.HasPrefix(str, "github.com/") || strings.HasPrefix(str, "git@github.com:") || (strings.HasSuffix(str, ".git") && IsURL(str))
 }
 
 // GetResolvConf opens and read the content of /etc/resolv.conf.
@@ -728,62 +736,103 @@ func GetResolvConf() ([]byte, error) {
 // CheckLocalDns looks into the /etc/resolv.conf,
 // it returns true if there is a local nameserver or if there is no nameserver.
 func CheckLocalDns(resolvConf []byte) bool {
-	var parsedResolvConf = StripComments(resolvConf, []byte("#"))
-	if !bytes.Contains(parsedResolvConf, []byte("nameserver")) {
-		return true
-	}
-	for _, ip := range [][]byte{
-		[]byte("127.0.0.1"),
-		[]byte("127.0.1.1"),
-	} {
-		if bytes.Contains(parsedResolvConf, ip) {
-			return true
+	for _, line := range GetLines(resolvConf, []byte("#")) {
+		if !bytes.Contains(line, []byte("nameserver")) {
+			continue
 		}
+		for _, ip := range [][]byte{
+			[]byte("127.0.0.1"),
+			[]byte("127.0.1.1"),
+		} {
+			if bytes.Contains(line, ip) {
+				return true
+			}
+		}
+		return false
 	}
-	return false
+	return true
 }
 
-// StripComments parses input into lines and strips away comments.
-func StripComments(input []byte, commentMarker []byte) []byte {
+// GetLines parses input into lines and strips away comments.
+func GetLines(input []byte, commentMarker []byte) [][]byte {
 	lines := bytes.Split(input, []byte("\n"))
-	var output []byte
+	var output [][]byte
 	for _, currentLine := range lines {
 		var commentIndex = bytes.Index(currentLine, commentMarker)
 		if commentIndex == -1 {
-			output = append(output, currentLine...)
+			output = append(output, currentLine)
 		} else {
-			output = append(output, currentLine[:commentIndex]...)
+			output = append(output, currentLine[:commentIndex])
 		}
-		output = append(output, []byte("\n")...)
 	}
 	return output
+}
+
+// GetNameservers returns nameservers (if any) listed in /etc/resolv.conf
+func GetNameservers(resolvConf []byte) []string {
+	nameservers := []string{}
+	re := regexp.MustCompile(`^\s*nameserver\s*(([0-9]+\.){3}([0-9]+))\s*$`)
+	for _, line := range GetLines(resolvConf, []byte("#")) {
+		var ns = re.FindSubmatch(line)
+		if len(ns) > 0 {
+			nameservers = append(nameservers, string(ns[1]))
+		}
+	}
+	return nameservers
 }
 
 // GetNameserversAsCIDR returns nameservers (if any) listed in
 // /etc/resolv.conf as CIDR blocks (e.g., "1.2.3.4/32")
 // This function's output is intended for net.ParseCIDR
 func GetNameserversAsCIDR(resolvConf []byte) []string {
-	var parsedResolvConf = StripComments(resolvConf, []byte("#"))
 	nameservers := []string{}
-	re := regexp.MustCompile(`^\s*nameserver\s*(([0-9]+\.){3}([0-9]+))\s*$`)
-	for _, line := range bytes.Split(parsedResolvConf, []byte("\n")) {
-		var ns = re.FindSubmatch(line)
-		if len(ns) > 0 {
-			nameservers = append(nameservers, string(ns[1])+"/32")
-		}
+	for _, nameserver := range GetNameservers(resolvConf) {
+		nameservers = append(nameservers, nameserver+"/32")
 	}
-
 	return nameservers
 }
 
-func ParseHost(host string, port int, addr string) (string, error) {
-	var proto string
+// GetSearchDomains returns search domains (if any) listed in /etc/resolv.conf
+// If more than one search line is encountered, only the contents of the last
+// one is returned.
+func GetSearchDomains(resolvConf []byte) []string {
+	re := regexp.MustCompile(`^\s*search\s*(([^\s]+\s*)*)$`)
+	domains := []string{}
+	for _, line := range GetLines(resolvConf, []byte("#")) {
+		match := re.FindSubmatch(line)
+		if match == nil {
+			continue
+		}
+		domains = strings.Fields(string(match[1]))
+	}
+	return domains
+}
+
+// FIXME: Change this not to receive default value as parameter
+func ParseHost(defaultHost string, defaultUnix, addr string) (string, error) {
+	var (
+		proto string
+		host  string
+		port  int
+	)
+	addr = strings.TrimSpace(addr)
 	switch {
+	case addr == "tcp://":
+		return "", fmt.Errorf("Invalid bind address format: %s", addr)
 	case strings.HasPrefix(addr, "unix://"):
-		return addr, nil
+		proto = "unix"
+		addr = strings.TrimPrefix(addr, "unix://")
+		if addr == "" {
+			addr = defaultUnix
+		}
 	case strings.HasPrefix(addr, "tcp://"):
 		proto = "tcp"
 		addr = strings.TrimPrefix(addr, "tcp://")
+	case strings.HasPrefix(addr, "fd://"):
+		return addr, nil
+	case addr == "":
+		proto = "unix"
+		addr = defaultUnix
 	default:
 		if strings.Contains(addr, "://") {
 			return "", fmt.Errorf("Invalid bind address protocol: %s", addr)
@@ -791,25 +840,36 @@ func ParseHost(host string, port int, addr string) (string, error) {
 		proto = "tcp"
 	}
 
-	if strings.Contains(addr, ":") {
+	if proto != "unix" && strings.Contains(addr, ":") {
 		hostParts := strings.Split(addr, ":")
 		if len(hostParts) != 2 {
 			return "", fmt.Errorf("Invalid bind address format: %s", addr)
 		}
 		if hostParts[0] != "" {
 			host = hostParts[0]
+		} else {
+			host = defaultHost
 		}
-		if p, err := strconv.Atoi(hostParts[1]); err == nil {
+
+		if p, err := strconv.Atoi(hostParts[1]); err == nil && p != 0 {
 			port = p
+		} else {
+			return "", fmt.Errorf("Invalid bind address format: %s", addr)
 		}
+
+	} else if proto == "tcp" && !strings.Contains(addr, ":") {
+		return "", fmt.Errorf("Invalid bind address format: %s", addr)
 	} else {
 		host = addr
+	}
+	if proto == "unix" {
+		return fmt.Sprintf("%s://%s", proto, host), nil
 	}
 	return fmt.Sprintf("%s://%s:%d", proto, host, port), nil
 }
 
 func GetReleaseVersion() string {
-	resp, err := http.Get("http://get.docker.io/latest")
+	resp, err := http.Get("https://get.docker.io/latest")
 	if err != nil {
 		return ""
 	}
@@ -836,153 +896,6 @@ func ParseRepositoryTag(repos string) (string, string) {
 		return repos[:n], tag
 	}
 	return repos, ""
-}
-
-type User struct {
-	Uid      string // user id
-	Gid      string // primary group id
-	Username string
-	Name     string
-	HomeDir  string
-}
-
-// UserLookup check if the given username or uid is present in /etc/passwd
-// and returns the user struct.
-// If the username is not found, an error is returned.
-func UserLookup(uid string) (*User, error) {
-	file, err := ioutil.ReadFile("/etc/passwd")
-	if err != nil {
-		return nil, err
-	}
-	for _, line := range strings.Split(string(file), "\n") {
-		data := strings.Split(line, ":")
-		if len(data) > 5 && (data[0] == uid || data[2] == uid) {
-			return &User{
-				Uid:      data[2],
-				Gid:      data[3],
-				Username: data[0],
-				Name:     data[4],
-				HomeDir:  data[5],
-			}, nil
-		}
-	}
-	return nil, fmt.Errorf("User not found in /etc/passwd")
-}
-
-type DependencyGraph struct {
-	nodes map[string]*DependencyNode
-}
-
-type DependencyNode struct {
-	id   string
-	deps map[*DependencyNode]bool
-}
-
-func NewDependencyGraph() DependencyGraph {
-	return DependencyGraph{
-		nodes: map[string]*DependencyNode{},
-	}
-}
-
-func (graph *DependencyGraph) addNode(node *DependencyNode) string {
-	if graph.nodes[node.id] == nil {
-		graph.nodes[node.id] = node
-	}
-	return node.id
-}
-
-func (graph *DependencyGraph) NewNode(id string) string {
-	if graph.nodes[id] != nil {
-		return id
-	}
-	nd := &DependencyNode{
-		id:   id,
-		deps: map[*DependencyNode]bool{},
-	}
-	graph.addNode(nd)
-	return id
-}
-
-func (graph *DependencyGraph) AddDependency(node, to string) error {
-	if graph.nodes[node] == nil {
-		return fmt.Errorf("Node %s does not belong to this graph", node)
-	}
-
-	if graph.nodes[to] == nil {
-		return fmt.Errorf("Node %s does not belong to this graph", to)
-	}
-
-	if node == to {
-		return fmt.Errorf("Dependency loops are forbidden!")
-	}
-
-	graph.nodes[node].addDependency(graph.nodes[to])
-	return nil
-}
-
-func (node *DependencyNode) addDependency(to *DependencyNode) bool {
-	node.deps[to] = true
-	return node.deps[to]
-}
-
-func (node *DependencyNode) Degree() int {
-	return len(node.deps)
-}
-
-// The magic happens here ::
-func (graph *DependencyGraph) GenerateTraversalMap() ([][]string, error) {
-	Debugf("Generating traversal map. Nodes: %d", len(graph.nodes))
-	result := [][]string{}
-	processed := map[*DependencyNode]bool{}
-	// As long as we haven't processed all nodes...
-	for len(processed) < len(graph.nodes) {
-		// Use a temporary buffer for processed nodes, otherwise
-		// nodes that depend on each other could end up in the same round.
-		tmpProcessed := []*DependencyNode{}
-		for _, node := range graph.nodes {
-			// If the node has more dependencies than what we have cleared,
-			// it won't be valid for this round.
-			if node.Degree() > len(processed) {
-				continue
-			}
-			// If it's already processed, get to the next one
-			if processed[node] {
-				continue
-			}
-			// It's not been processed yet and has 0 deps. Add it!
-			// (this is a shortcut for what we're doing below)
-			if node.Degree() == 0 {
-				tmpProcessed = append(tmpProcessed, node)
-				continue
-			}
-			// If at least one dep hasn't been processed yet, we can't
-			// add it.
-			ok := true
-			for dep := range node.deps {
-				if !processed[dep] {
-					ok = false
-					break
-				}
-			}
-			// All deps have already been processed. Add it!
-			if ok {
-				tmpProcessed = append(tmpProcessed, node)
-			}
-		}
-		Debugf("Round %d: found %d available nodes", len(result), len(tmpProcessed))
-		// If no progress has been made this round,
-		// that means we have circular dependencies.
-		if len(tmpProcessed) == 0 {
-			return nil, fmt.Errorf("Could not find a solution to this dependency graph")
-		}
-		round := []string{}
-		for _, nd := range tmpProcessed {
-			round = append(round, nd.id)
-			processed[nd] = true
-		}
-		result = append(result, round)
-	}
-	return result, nil
 }
 
 // An StatusError reports an unsuccessful exit by a command.
@@ -1028,16 +941,6 @@ func ShellQuoteArguments(args []string) string {
 		quote(arg, &buf)
 	}
 	return buf.String()
-}
-
-func IsClosedError(err error) bool {
-	/* This comparison is ugly, but unfortunately, net.go doesn't export errClosing.
-	 * See:
-	 * http://golang.org/src/pkg/net/net.go
-	 * https://code.google.com/p/go/issues/detail?id=4337
-	 * https://groups.google.com/forum/#!msg/golang-nuts/0_aaCvBmOcM/SptmDyX1XJMJ
-	 */
-	return strings.HasSuffix(err.Error(), "use of closed network connection")
 }
 
 func PartParser(template, data string) (map[string]string, error) {
@@ -1116,4 +1019,68 @@ func CopyFile(src, dst string) (int64, error) {
 	}
 	defer df.Close()
 	return io.Copy(df, sf)
+}
+
+type readCloserWrapper struct {
+	io.Reader
+	closer func() error
+}
+
+func (r *readCloserWrapper) Close() error {
+	return r.closer()
+}
+
+func NewReadCloserWrapper(r io.Reader, closer func() error) io.ReadCloser {
+	return &readCloserWrapper{
+		Reader: r,
+		closer: closer,
+	}
+}
+
+// ReplaceOrAppendValues returns the defaults with the overrides either
+// replaced by env key or appended to the list
+func ReplaceOrAppendEnvValues(defaults, overrides []string) []string {
+	cache := make(map[string]int, len(defaults))
+	for i, e := range defaults {
+		parts := strings.SplitN(e, "=", 2)
+		cache[parts[0]] = i
+	}
+	for _, value := range overrides {
+		parts := strings.SplitN(value, "=", 2)
+		if i, exists := cache[parts[0]]; exists {
+			defaults[i] = value
+		} else {
+			defaults = append(defaults, value)
+		}
+	}
+	return defaults
+}
+
+// ReadSymlinkedDirectory returns the target directory of a symlink.
+// The target of the symbolic link may not be a file.
+func ReadSymlinkedDirectory(path string) (string, error) {
+	var realPath string
+	var err error
+	if realPath, err = filepath.Abs(path); err != nil {
+		return "", fmt.Errorf("unable to get absolute path for %s: %s", path, err)
+	}
+	if realPath, err = filepath.EvalSymlinks(realPath); err != nil {
+		return "", fmt.Errorf("failed to canonicalise path for %s: %s", path, err)
+	}
+	realPathInfo, err := os.Stat(realPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat target '%s' of '%s': %s", realPath, path, err)
+	}
+	if !realPathInfo.Mode().IsDir() {
+		return "", fmt.Errorf("canonical path points to a file '%s'", realPath)
+	}
+	return realPath, nil
+}
+
+func ParseKeyValueOpt(opt string) (string, string, error) {
+	parts := strings.SplitN(opt, "=", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("Unable to parse key/value option: %s", opt)
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
 }

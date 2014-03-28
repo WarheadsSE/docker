@@ -56,7 +56,7 @@ func main() {
 
 	// Check that the requested process manager is supported
 	if _, exists := templates[*kind]; !exists {
-		panic("Unkown script template")
+		panic("Unknown script template")
 	}
 
 	// Load the requested template
@@ -70,7 +70,7 @@ func main() {
 	bufErr := bytes.NewBuffer(nil)
 
 	// Instanciate the Docker CLI
-	cli := docker.NewDockerCli(nil, bufOut, bufErr, "unix", "/var/run/docker.sock")
+	cli := docker.NewDockerCli(nil, bufOut, bufErr, "unix", "/var/run/docker.sock", false, nil)
 	// Retrieve the container info
 	if err := cli.CmdInspect(flag.Arg(0)); err != nil {
 		// As of docker v0.6.3, CmdInspect always returns nil

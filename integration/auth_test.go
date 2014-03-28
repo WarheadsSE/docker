@@ -3,7 +3,8 @@ package docker
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"github.com/dotcloud/docker/auth"
+	"fmt"
+	"github.com/dotcloud/docker/registry"
 	"os"
 	"strings"
 	"testing"
@@ -17,8 +18,13 @@ import (
 func TestLogin(t *testing.T) {
 	os.Setenv("DOCKER_INDEX_URL", "https://indexstaging-docker.dotcloud.com")
 	defer os.Setenv("DOCKER_INDEX_URL", "")
-	authConfig := &auth.AuthConfig{Username: "unittester", Password: "surlautrerivejetattendrai", Email: "noise+unittester@dotcloud.com"}
-	status, err := auth.Login(authConfig, nil)
+	authConfig := &registry.AuthConfig{
+		Username:      "unittester",
+		Password:      "surlautrerivejetattendrai",
+		Email:         "noise+unittester@docker.com",
+		ServerAddress: "https://indexstaging-docker.dotcloud.com/v1/",
+	}
+	status, err := registry.Login(authConfig, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,8 +34,6 @@ func TestLogin(t *testing.T) {
 }
 
 func TestCreateAccount(t *testing.T) {
-	os.Setenv("DOCKER_INDEX_URL", "https://indexstaging-docker.dotcloud.com")
-	defer os.Setenv("DOCKER_INDEX_URL", "")
 	tokenBuffer := make([]byte, 16)
 	_, err := rand.Read(tokenBuffer)
 	if err != nil {
@@ -37,18 +41,25 @@ func TestCreateAccount(t *testing.T) {
 	}
 	token := hex.EncodeToString(tokenBuffer)[:12]
 	username := "ut" + token
-	authConfig := &auth.AuthConfig{Username: username, Password: "test42", Email: "docker-ut+" + token + "@example.com"}
-	status, err := auth.Login(authConfig, nil)
+	authConfig := &registry.AuthConfig{
+		Username:      username,
+		Password:      "test42",
+		Email:         fmt.Sprintf("docker-ut+%s@example.com", token),
+		ServerAddress: "https://indexstaging-docker.dotcloud.com/v1/",
+	}
+	status, err := registry.Login(authConfig, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedStatus := "Account created. Please use the confirmation link we sent" +
-		" to your e-mail to activate it."
+	expectedStatus := fmt.Sprintf(
+		"Account created. Please see the documentation of the registry %s for instructions how to activate it.",
+		authConfig.ServerAddress,
+	)
 	if status != expectedStatus {
 		t.Fatalf("Expected status: \"%s\", found \"%s\" instead.", expectedStatus, status)
 	}
 
-	status, err = auth.Login(authConfig, nil)
+	status, err = registry.Login(authConfig, nil)
 	if err == nil {
 		t.Fatalf("Expected error but found nil instead")
 	}

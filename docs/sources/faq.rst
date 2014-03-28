@@ -25,9 +25,9 @@ Does Docker run on Mac OS X or Windows?
 
    Not at this time, Docker currently only runs on Linux, but you can
    use VirtualBox to run Docker in a virtual machine on your box, and
-   get the best of both worlds. Check out the
-   :ref:`install_using_vagrant` and :ref:`windows` installation
-   guides.
+   get the best of both worlds. Check out the :ref:`macosx` and
+   :ref:`windows` installation guides. The small Linux distribution boot2docker
+   can be run inside virtual machines on these two operating systems.
 
 How do containers compare to virtual machines?
 ..............................................
@@ -111,7 +111,7 @@ What does Docker add to just plain LXC?
       registry to store and transfer private containers, for internal
       server deployments for example.
 
-   * *Tool ecosystem.* 
+   * *Tool ecosystem.*
       Docker defines an API for automating and customizing the
       creation and deployment of containers. There are a huge number
       of tools integrating with Docker to extend its
@@ -122,6 +122,11 @@ What does Docker add to just plain LXC?
       (Jenkins, Strider, Travis), etc. Docker is rapidly establishing
       itself as the standard for container-based tooling.
 
+What is different between a Docker container and a VM?
+......................................................
+
+There's a great StackOverflow answer `showing the differences <http://stackoverflow.com/questions/16047306/how-is-docker-io-different-from-a-normal-virtual-machine>`_.
+
 Do I lose my data when the container exits?
 ...........................................
 
@@ -129,10 +134,70 @@ Not at all! Any data that your application writes to disk gets preserved
 in its container until you explicitly delete the container. The file
 system for the container persists even after the container halts.
 
+How far do Docker containers scale?
+...................................
+
+Some of the largest server farms in the world today are based on containers.
+Large web deployments like Google and Twitter, and platform providers such as
+Heroku and dotCloud all run on container technology, at a scale of hundreds of
+thousands or even millions of containers running in parallel.
+
+How do I connect Docker containers?
+...................................
+
+Currently the recommended way to link containers is via the `link` primitive.
+You can see details of how to `work with links here
+<http://docs.docker.io/en/latest/use/working_with_links_names/>`_.
+
+Also of useful when enabling more flexible service portability is the
+`Ambassador linking pattern
+<http://docs.docker.io/en/latest/use/ambassador_pattern_linking/>`_.
+
+How do I run more than one process in a Docker container?
+.........................................................
+
+Any capable process supervisor such as http://supervisord.org/, runit, s6, or
+daemontools can do the trick. Docker will start up the process management
+daemon which will then fork to run additional processes. As long as the
+processor manager daemon continues to run, the container will continue to as
+well.  You can see a more substantial example `that uses supervisord here
+<http://docs.docker.io/en/latest/examples/using_supervisord/>`_.
+
+What platforms does Docker run on?
+..................................
+
+Linux:
+
+- Ubuntu 12.04, 13.04 et al
+- Fedora 19/20+
+- RHEL 6.5+
+- Centos 6+
+- Gentoo
+- ArchLinux
+- openSUSE 12.3+
+- CRUX 3.0+
+
+Cloud:
+
+- Amazon EC2
+- Google Compute Engine
+- Rackspace
+
+How do I report a security issue with Docker?
+.............................................
+
+You can learn about the project's security policy `here <http://www.docker.io/security/>`_
+and report security issues to this `mailbox <mailto:security@docker.com>`_.
+
+Why do I need to sign my commits to Docker with the DCO?
+........................................................
+
+Please read `our blog post <http://blog.docker.io/2014/01/docker-code-contributions-require-developer-certificate-of-origin/>`_ on the introduction of the DCO.
+
 Can I help by adding some questions and answers?
 ................................................
 
-   Definitely! You can fork `the repo`_ and edit the documentation sources.
+Definitely! You can fork `the repo`_ and edit the documentation sources.
 
 
 Where can I find more answers?
@@ -143,7 +208,7 @@ Where can I find more answers?
     * `Docker user mailinglist`_
     * `Docker developer mailinglist`_
     * `IRC, docker on freenode`_
-    * `Github`_
+    * `GitHub`_
     * `Ask questions on Stackoverflow`_
     * `Join the conversation on Twitter`_
 
@@ -155,6 +220,5 @@ Where can I find more answers?
     .. _Github: http://www.github.com/dotcloud/docker
     .. _Ask questions on Stackoverflow: http://stackoverflow.com/search?q=docker
     .. _Join the conversation on Twitter: http://twitter.com/docker
-
 
 Looking for something else to read? Checkout the :ref:`hello_world` example.

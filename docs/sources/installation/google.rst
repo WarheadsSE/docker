@@ -43,21 +43,14 @@
     $ gcutil ssh docker-playground
     docker-playground:~$ 
 
-5. Enable IP forwarding:
-
-.. code-block:: bash
-
-    docker-playground:~$ echo net.ipv4.ip_forward=1 | sudo tee /etc/sysctl.d/99-docker.conf 
-    docker-playground:~$ sudo sysctl --system
-
-6. Install the latest Docker release and configure it to start when the instance boots:
+5. Install the latest Docker release and configure it to start when the instance boots:
 
 .. code-block:: bash
 
     docker-playground:~$ curl get.docker.io | bash
     docker-playground:~$ sudo update-rc.d docker defaults
 
-7. Start a new container:
+6. Start a new container:
 
 .. code-block:: bash
 

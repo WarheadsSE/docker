@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 # This script builds various binary artifacts from a checkout of the docker
@@ -15,8 +15,9 @@ set -e
 # - The script is intented to be run inside the docker container specified
 #   in the Dockerfile at the root of the source. In other words:
 #   DO NOT CALL THIS SCRIPT DIRECTLY.
-# - The right way to call this script is to invoke "docker build ." from
-#   your checkout of the Docker repository, and then
+# - The right way to call this script is to invoke "make" from
+#   your checkout of the Docker repository.
+#   the Makefile will do a "docker build -t docker ." and then
 #   "docker run hack/make.sh" in the resulting container image.
 #
 
@@ -24,27 +25,37 @@ set -o pipefail
 
 # We're a nice, sexy, little shell script, and people might try to run us;
 # but really, they shouldn't. We want to be in a container!
-RESOLVCONF=$(readlink --canonicalize /etc/resolv.conf)
-grep -q "$RESOLVCONF" /proc/mounts || {
-	echo >&2 "# WARNING! I don't seem to be running in a docker container."
-	echo >&2 "# The result of this command might be an incorrect build, and will not be officially supported."
-	echo >&2 "# Try this: 'docker build -t docker . && docker run docker ./hack/make.sh'"
-}
+if [ "$(pwd)" != '/go/src/github.com/dotcloud/docker' ] || [ -z "$DOCKER_CROSSPLATFORMS" ]; then
+	{
+		echo "# WARNING! I don't seem to be running in the Docker container."
+		echo "# The result of this command might be an incorrect build, and will not be"
+		echo "#   officially supported."
+		echo "#"
+		echo "# Try this instead: make all"
+		echo "#"
+	} >&2
+fi
+
+echo
 
 # List of bundles to create when no argument is passed
 DEFAULT_BUNDLES=(
 	binary
 	test
+	test-integration
 	dynbinary
 	dyntest
+	dyntest-integration
+	cover
+	cross
 	tgz
 	ubuntu
 )
 
 VERSION=$(cat ./VERSION)
-if [ -d .git ] && command -v git &> /dev/null; then
+if command -v git &> /dev/null && git rev-parse &> /dev/null; then
 	GITCOMMIT=$(git rev-parse --short HEAD)
-	if [ -n "$(git status --porcelain)" ]; then
+	if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 		GITCOMMIT="$GITCOMMIT-dirty"
 	fi
 elif [ "$DOCKER_GITCOMMIT" ]; then
@@ -57,10 +68,107 @@ else
 	exit 1
 fi
 
+if [ "$AUTO_GOPATH" ]; then
+	rm -rf .gopath
+	mkdir -p .gopath/src/github.com/dotcloud
+	ln -sf ../../../.. .gopath/src/github.com/dotcloud/docker
+	export GOPATH="$(pwd)/.gopath:$(pwd)/vendor"
+fi
+
+if [ ! "$GOPATH" ]; then
+	echo >&2 'error: missing GOPATH; please see http://golang.org/doc/code.html#GOPATH'
+	echo >&2 '  alternatively, set AUTO_GOPATH=1'
+	exit 1
+fi
+
 # Use these flags when compiling the tests and final binary
-LDFLAGS='-X main.GITCOMMIT "'$GITCOMMIT'" -X main.VERSION "'$VERSION'" -w'
-LDFLAGS_STATIC='-X github.com/dotcloud/docker/utils.IAMSTATIC true -linkmode external -extldflags "-lpthread -static -Wl,--unresolved-symbols=ignore-in-object-files"'
-BUILDFLAGS='-tags netgo'
+LDFLAGS='
+	-w
+	-X github.com/dotcloud/docker/dockerversion.GITCOMMIT "'$GITCOMMIT'"
+	-X github.com/dotcloud/docker/dockerversion.VERSION "'$VERSION'"
+'
+LDFLAGS_STATIC='-linkmode external'
+EXTLDFLAGS_STATIC='-static'
+BUILDFLAGS=( -a -tags "netgo static_build $DOCKER_BUILDTAGS" )
+
+# A few more flags that are specific just to building a completely-static binary (see hack/make/binary)
+# PLEASE do not use these anywhere else.
+EXTLDFLAGS_STATIC_DOCKER="$EXTLDFLAGS_STATIC -lpthread -Wl,--unresolved-symbols=ignore-in-object-files"
+LDFLAGS_STATIC_DOCKER="
+	$LDFLAGS_STATIC
+	-X github.com/dotcloud/docker/dockerversion.IAMSTATIC true
+	-extldflags \"$EXTLDFLAGS_STATIC_DOCKER\"
+"
+
+HAVE_GO_TEST_COVER=
+if \
+	go help testflag | grep -- -cover > /dev/null \
+	&& go tool -n cover > /dev/null 2>&1 \
+; then
+	HAVE_GO_TEST_COVER=1
+fi
+
+# If $TESTFLAGS is set in the environment, it is passed as extra arguments to 'go test'.
+# You can use this to select certain tests to run, eg.
+#
+#   TESTFLAGS='-run ^TestBuild$' ./hack/make.sh test
+#
+go_test_dir() {
+	dir=$1
+	coverpkg=$2
+	testcover=()
+	if [ "$HAVE_GO_TEST_COVER" ]; then
+		# if our current go install has -cover, we want to use it :)
+		mkdir -p "$DEST/coverprofiles"
+		coverprofile="docker${dir#.}"
+		coverprofile="$DEST/coverprofiles/${coverprofile//\//-}"
+		testcover=( -cover -coverprofile "$coverprofile" $coverpkg )
+	fi
+	(
+		echo '+ go test' $TESTFLAGS "github.com/dotcloud/docker${dir#.}"
+		cd "$dir"
+		go test ${testcover[@]} -ldflags "$LDFLAGS" "${BUILDFLAGS[@]}" $TESTFLAGS
+	)
+}
+
+# This helper function walks the current directory looking for directories
+# holding certain files ($1 parameter), and prints their paths on standard
+# output, one per line.
+find_dirs() {
+	find -not \( \
+		\( \
+			-wholename './vendor' \
+			-o -wholename './integration' \
+			-o -wholename './contrib' \
+			-o -wholename './pkg/mflag/example' \
+			-o -wholename './.git' \
+			-o -wholename './bundles' \
+			-o -wholename './docs' \
+		\) \
+		-prune \
+	\) -name "$1" -print0 | xargs -0n1 dirname | sort -u
+}
+
+hash_files() {
+	while [ $# -gt 0 ]; do
+		f="$1"
+		shift
+		dir="$(dirname "$f")"
+		base="$(basename "$f")"
+		for hashAlgo in md5 sha256; do
+			if command -v "${hashAlgo}sum" &> /dev/null; then
+				(
+					# subshell and cd so that we get output files like:
+					#   $HASH docker-$VERSION
+					# instead of:
+					#   $HASH /go/src/github.com/.../$VERSION/binary/docker-$VERSION
+					cd "$dir"
+					"${hashAlgo}sum" "$base" > "$base.$hashAlgo"
+				)
+			fi
+		done
+	done
+}
 
 bundle() {
 	bundlescript=$1

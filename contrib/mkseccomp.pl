@@ -10,7 +10,7 @@
 # can configure the list of syscalls.  When run, this script produces output
 # which, when stored in a file, can be passed to docker as follows:
 #
-# docker run -lxc-conf="lxc.seccomp=$file" <rest of arguments>
+# docker run --lxc-conf="lxc.seccomp=$file" <rest of arguments>
 #
 # The included sample file shows how to cut about a quarter of all syscalls,
 # which affecting most applications.
@@ -41,7 +41,7 @@ use warnings;
 
 if( -t ) {
     print STDERR "Helper script to make seccomp filters for Docker/LXC.\n";
-    print STDERR "Usage: mkseccomp.pl [files...]\n";
+    print STDERR "Usage: mkseccomp.pl < [files...]\n";
     exit 1;
 }
 

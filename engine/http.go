@@ -1,8 +1,8 @@
 package engine
 
 import (
-	"path"
 	"net/http"
+	"path"
 )
 
 // ServeHTTP executes a job as specified by the http request `r`, and sends the
@@ -16,13 +16,15 @@ import (
 // as the exit status.
 //
 func (eng *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	jobName := path.Base(r.URL.Path)
-	jobArgs, exists := r.URL.Query()["a"]
+	var (
+		jobName         = path.Base(r.URL.Path)
+		jobArgs, exists = r.URL.Query()["a"]
+	)
 	if !exists {
 		jobArgs = []string{}
 	}
 	w.Header().Set("Job-Name", jobName)
-	for _, arg := range(jobArgs) {
+	for _, arg := range jobArgs {
 		w.Header().Add("Job-Args", arg)
 	}
 	job := eng.Job(jobName, jobArgs...)

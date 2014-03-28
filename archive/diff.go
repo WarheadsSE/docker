@@ -1,6 +1,10 @@
 package archive
 
 import (
+	"fmt"
+	"github.com/dotcloud/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar"
+	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,87 +12,146 @@ import (
 	"time"
 )
 
+// Linux device nodes are a bit weird due to backwards compat with 16 bit device nodes.
+// They are, from low to high: the lower 8 bits of the minor, then 12 bits of the major,
+// then the top 12 bits of the minor
+func mkdev(major int64, minor int64) uint32 {
+	return uint32(((minor & 0xfff00) << 12) | ((major & 0xfff) << 8) | (minor & 0xff))
+}
+func timeToTimespec(time time.Time) (ts syscall.Timespec) {
+	if time.IsZero() {
+		// Return UTIME_OMIT special value
+		ts.Sec = 0
+		ts.Nsec = ((1 << 30) - 2)
+		return
+	}
+	return syscall.NsecToTimespec(time.UnixNano())
+}
+
 // ApplyLayer parses a diff in the standard layer format from `layer`, and
 // applies it to the directory `dest`.
-func ApplyLayer(dest string, layer Archive) error {
-	// Poor man's diff applyer in 2 steps:
+func ApplyLayer(dest string, layer ArchiveReader) error {
+	// We need to be able to set any perms
+	oldmask := syscall.Umask(0)
+	defer syscall.Umask(oldmask)
 
-	// Step 1: untar everything in place
-	if err := Untar(layer, dest, nil); err != nil {
-		return err
-	}
-
-	modifiedDirs := make(map[string]*syscall.Stat_t)
-	addDir := func(file string) {
-		d := filepath.Dir(file)
-		if _, exists := modifiedDirs[d]; !exists {
-			if s, err := os.Lstat(d); err == nil {
-				if sys := s.Sys(); sys != nil {
-					if stat, ok := sys.(*syscall.Stat_t); ok {
-						modifiedDirs[d] = stat
-					}
-				}
-			}
-		}
-	}
-
-	// Step 2: walk for whiteouts and apply them, removing them in the process
-	err := filepath.Walk(dest, func(fullPath string, f os.FileInfo, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				// This happens in the case of whiteouts in parent dir removing a directory
-				// We just ignore it
-				return filepath.SkipDir
-			}
-			return err
-		}
-
-		// Rebase path
-		path, err := filepath.Rel(dest, fullPath)
-		if err != nil {
-			return err
-		}
-		path = filepath.Join("/", path)
-
-		// Skip AUFS metadata
-		if matched, err := filepath.Match("/.wh..wh.*", path); err != nil {
-			return err
-		} else if matched {
-			addDir(fullPath)
-			if err := os.RemoveAll(fullPath); err != nil {
-				return err
-			}
-		}
-
-		filename := filepath.Base(path)
-		if strings.HasPrefix(filename, ".wh.") {
-			rmTargetName := filename[len(".wh."):]
-			rmTargetPath := filepath.Join(filepath.Dir(fullPath), rmTargetName)
-
-			// Remove the file targeted by the whiteout
-			addDir(rmTargetPath)
-			if err := os.RemoveAll(rmTargetPath); err != nil {
-				return err
-			}
-			// Remove the whiteout itself
-			addDir(fullPath)
-			if err := os.RemoveAll(fullPath); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	layer, err := DecompressStream(layer)
 	if err != nil {
 		return err
 	}
 
-	for k, v := range modifiedDirs {
-		lastAccess := getLastAccess(v)
-		lastModification := getLastModification(v)
-		aTime := time.Unix(lastAccess.Unix())
-		mTime := time.Unix(lastModification.Unix())
+	tr := tar.NewReader(layer)
 
-		if err := os.Chtimes(k, aTime, mTime); err != nil {
+	var dirs []*tar.Header
+
+	aufsTempdir := ""
+	aufsHardlinks := make(map[string]*tar.Header)
+
+	// Iterate through the files in the archive.
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			// end of tar archive
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		// Normalize name, for safety and for a simple is-root check
+		hdr.Name = filepath.Clean(hdr.Name)
+
+		if !strings.HasSuffix(hdr.Name, "/") {
+			// Not the root directory, ensure that the parent directory exists.
+			// This happened in some tests where an image had a tarfile without any
+			// parent directories.
+			parent := filepath.Dir(hdr.Name)
+			parentPath := filepath.Join(dest, parent)
+			if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
+				err = os.MkdirAll(parentPath, 600)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// Skip AUFS metadata dirs
+		if strings.HasPrefix(hdr.Name, ".wh..wh.") {
+			// Regular files inside /.wh..wh.plnk can be used as hardlink targets
+			// We don't want this directory, but we need the files in them so that
+			// such hardlinks can be resolved.
+			if strings.HasPrefix(hdr.Name, ".wh..wh.plnk") && hdr.Typeflag == tar.TypeReg {
+				basename := filepath.Base(hdr.Name)
+				aufsHardlinks[basename] = hdr
+				if aufsTempdir == "" {
+					if aufsTempdir, err = ioutil.TempDir("", "dockerplnk"); err != nil {
+						return err
+					}
+					defer os.RemoveAll(aufsTempdir)
+				}
+				if err := createTarFile(filepath.Join(aufsTempdir, basename), dest, hdr, tr); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		path := filepath.Join(dest, hdr.Name)
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, ".wh.") {
+			originalBase := base[len(".wh."):]
+			originalPath := filepath.Join(filepath.Dir(path), originalBase)
+			if err := os.RemoveAll(originalPath); err != nil {
+				return err
+			}
+		} else {
+			// If path exits we almost always just want to remove and replace it.
+			// The only exception is when it is a directory *and* the file from
+			// the layer is also a directory. Then we want to merge them (i.e.
+			// just apply the metadata from the layer).
+			if fi, err := os.Lstat(path); err == nil {
+				if !(fi.IsDir() && hdr.Typeflag == tar.TypeDir) {
+					if err := os.RemoveAll(path); err != nil {
+						return err
+					}
+				}
+			}
+
+			srcData := io.Reader(tr)
+			srcHdr := hdr
+
+			// Hard links into /.wh..wh.plnk don't work, as we don't extract that directory, so
+			// we manually retarget these into the temporary files we extracted them into
+			if hdr.Typeflag == tar.TypeLink && strings.HasPrefix(filepath.Clean(hdr.Linkname), ".wh..wh.plnk") {
+				linkBasename := filepath.Base(hdr.Linkname)
+				srcHdr = aufsHardlinks[linkBasename]
+				if srcHdr == nil {
+					return fmt.Errorf("Invalid aufs hardlink")
+				}
+				tmpFile, err := os.Open(filepath.Join(aufsTempdir, linkBasename))
+				if err != nil {
+					return err
+				}
+				defer tmpFile.Close()
+				srcData = tmpFile
+			}
+
+			if err := createTarFile(path, dest, srcHdr, srcData); err != nil {
+				return err
+			}
+
+			// Directory mtimes must be handled at the end to avoid further
+			// file creation in them to modify the directory mtime
+			if hdr.Typeflag == tar.TypeDir {
+				dirs = append(dirs, hdr)
+			}
+		}
+	}
+
+	for _, hdr := range dirs {
+		path := filepath.Join(dest, hdr.Name)
+		ts := []syscall.Timespec{timeToTimespec(hdr.AccessTime), timeToTimespec(hdr.ModTime)}
+		if err := syscall.UtimesNano(path, ts); err != nil {
 			return err
 		}
 	}

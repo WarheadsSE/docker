@@ -18,11 +18,11 @@ Firstly, we create a ``Dockerfile`` for our new Redis image.
 
 .. code-block:: bash
 
-    FROM        ubuntu:12.10
-    RUN         apt-get update
-    RUN         apt-get -y install redis-server
+    FROM        debian:jessie
+    RUN         apt-get update && apt-get install -y redis-server
     EXPOSE      6379
     ENTRYPOINT  ["/usr/bin/redis-server"]
+    CMD ["--bind", "0.0.0.0"]
 
 Next we build an image from our ``Dockerfile``. Replace ``<your username>`` 
 with your own user name.
@@ -44,19 +44,19 @@ use a container link to provide access to our Redis database.
 
 .. code-block:: bash
 
-    sudo docker run -name redis -d <your username>/redis
+    sudo docker run --name redis -d <your username>/redis
 
 Create your web application container
 -------------------------------------
 
-Next we can create a container for our application. We're going to use the ``-link`` 
+Next we can create a container for our application. We're going to use the ``--link`` 
 flag to create a link to the ``redis`` container we've just created with an alias of 
 ``db``. This will create a secure tunnel to the ``redis`` container and expose the 
 Redis instance running inside that container to only this container.
 
 .. code-block:: bash
 
-    sudo docker run -link redis:db -i -t ubuntu:12.10 /bin/bash
+    sudo docker run --link redis:db -i -t ubuntu:12.10 /bin/bash
 
 Once inside our freshly created container we need to install Redis to get the 
 ``redis-cli`` binary to test our connection.
@@ -67,14 +67,14 @@ Once inside our freshly created container we need to install Redis to get the
     apt-get -y install redis-server
     service redis-server stop
 
-Now we can test the connection. Firstly, let's look at the available environmental 
-variables in our web application container. We can use these to get the IP and port 
-of our ``redis`` container.
+As we've used the ``--link redis:db`` option, Docker has created some environment 
+variables in our web application container.
 
 .. code-block:: bash
 
-    env
-    . . .
+    env | grep DB_
+    
+    # Should return something similar to this with your values 
     DB_NAME=/violet_wolf/db
     DB_PORT_6379_TCP_PORT=6379
     DB_PORT=tcp://172.17.0.33:6379
