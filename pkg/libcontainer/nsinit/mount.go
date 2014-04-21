@@ -32,23 +32,25 @@ func setupNewMountNamespace(rootfs string, bindMounts []libcontainer.Mount, cons
 	if err := system.Mount(rootfs, rootfs, "bind", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 		return fmt.Errorf("mouting %s as bind %s", rootfs, err)
 	}
-	if readonly {
-		if err := system.Mount(rootfs, rootfs, "bind", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_REC, ""); err != nil {
-			return fmt.Errorf("mounting %s as readonly %s", rootfs, err)
-		}
-	}
 	if err := mountSystem(rootfs, mountLabel); err != nil {
 		return fmt.Errorf("mount system %s", err)
 	}
 
 	for _, m := range bindMounts {
-		flags := syscall.MS_BIND | syscall.MS_REC
+		var (
+			flags = syscall.MS_BIND | syscall.MS_REC
+			dest  = filepath.Join(rootfs, m.Destination)
+		)
 		if !m.Writable {
 			flags = flags | syscall.MS_RDONLY
 		}
-		dest := filepath.Join(rootfs, m.Destination)
 		if err := system.Mount(m.Source, dest, "bind", uintptr(flags), ""); err != nil {
 			return fmt.Errorf("mounting %s into %s %s", m.Source, dest, err)
+		}
+		if !m.Writable {
+			if err := system.Mount(m.Source, dest, "bind", uintptr(flags|syscall.MS_REMOUNT), ""); err != nil {
+				return fmt.Errorf("remounting %s into %s %s", m.Source, dest, err)
+			}
 		}
 		if m.Private {
 			if err := system.Mount("", dest, "none", uintptr(syscall.MS_PRIVATE), ""); err != nil {
@@ -59,11 +61,6 @@ func setupNewMountNamespace(rootfs string, bindMounts []libcontainer.Mount, cons
 
 	if err := copyDevNodes(rootfs); err != nil {
 		return fmt.Errorf("copy dev nodes %s", err)
-	}
-	// In non-privileged mode, this fails. Discard the error.
-	setupLoopbackDevices(rootfs)
-	if err := setupDev(rootfs); err != nil {
-		return err
 	}
 	if err := setupPtmx(rootfs, console, mountLabel); err != nil {
 		return err
@@ -79,6 +76,12 @@ func setupNewMountNamespace(rootfs string, bindMounts []libcontainer.Mount, cons
 	} else {
 		if err := rootPivot(rootfs); err != nil {
 			return err
+		}
+	}
+
+	if readonly {
+		if err := system.Mount("/", "/", "bind", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("mounting %s as readonly %s", rootfs, err)
 		}
 	}
 
@@ -144,19 +147,6 @@ func copyDevNodes(rootfs string) error {
 	return nil
 }
 
-func setupLoopbackDevices(rootfs string) error {
-	for i := 0; ; i++ {
-		if err := copyDevNode(rootfs, fmt.Sprintf("loop%d", i)); err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			break
-		}
-
-	}
-	return nil
-}
-
 func copyDevNode(rootfs, node string) error {
 	stat, err := os.Stat(filepath.Join("/dev", node))
 	if err != nil {
@@ -168,30 +158,6 @@ func copyDevNode(rootfs, node string) error {
 	)
 	if err := system.Mknod(dest, st.Mode, int(st.Rdev)); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("copy %s %s", node, err)
-	}
-	return nil
-}
-
-// setupDev symlinks the current processes pipes into the
-// appropriate destination on the containers rootfs
-func setupDev(rootfs string) error {
-	for _, link := range []struct {
-		from string
-		to   string
-	}{
-		{"/proc/kcore", "/dev/core"},
-		{"/proc/self/fd", "/dev/fd"},
-		{"/proc/self/fd/0", "/dev/stdin"},
-		{"/proc/self/fd/1", "/dev/stdout"},
-		{"/proc/self/fd/2", "/dev/stderr"},
-	} {
-		dest := filepath.Join(rootfs, link.to)
-		if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove %s %s", dest, err)
-		}
-		if err := os.Symlink(link.from, dest); err != nil {
-			return fmt.Errorf("symlink %s %s", dest, err)
-		}
 	}
 	return nil
 }
@@ -242,7 +208,7 @@ func mountSystem(rootfs string, mountLabel string) error {
 	}{
 		{source: "proc", path: filepath.Join(rootfs, "proc"), device: "proc", flags: defaultMountFlags},
 		{source: "sysfs", path: filepath.Join(rootfs, "sys"), device: "sysfs", flags: defaultMountFlags},
-		{source: "shm", path: filepath.Join(rootfs, "dev", "shm"), device: "tmpfs", flags: defaultMountFlags, data: label.FormatMountLabel("mode=1755,size=65536k", mountLabel)},
+		{source: "shm", path: filepath.Join(rootfs, "dev", "shm"), device: "tmpfs", flags: defaultMountFlags, data: label.FormatMountLabel("mode=1777,size=65536k", mountLabel)},
 		{source: "devpts", path: filepath.Join(rootfs, "dev", "pts"), device: "devpts", flags: syscall.MS_NOSUID | syscall.MS_NOEXEC, data: label.FormatMountLabel("newinstance,ptmxmode=0666,mode=620,gid=5", mountLabel)},
 	} {
 		if err := os.MkdirAll(m.path, 0755); err != nil && !os.IsExist(err) {

@@ -14,7 +14,9 @@ type HostConfig struct {
 	PortBindings    nat.PortMap
 	Links           []string
 	PublishAllPorts bool
-	DriverOptions   map[string][]string
+	Dns             []string
+	DnsSearch       []string
+	VolumesFrom     []string
 }
 
 func ContainerHostConfigFromJob(job *engine.Job) *HostConfig {
@@ -25,13 +27,20 @@ func ContainerHostConfigFromJob(job *engine.Job) *HostConfig {
 	}
 	job.GetenvJson("LxcConf", &hostConfig.LxcConf)
 	job.GetenvJson("PortBindings", &hostConfig.PortBindings)
-	job.GetenvJson("DriverOptions", &hostConfig.DriverOptions)
 	if Binds := job.GetenvList("Binds"); Binds != nil {
 		hostConfig.Binds = Binds
 	}
 	if Links := job.GetenvList("Links"); Links != nil {
 		hostConfig.Links = Links
 	}
-
+	if Dns := job.GetenvList("Dns"); Dns != nil {
+		hostConfig.Dns = Dns
+	}
+	if DnsSearch := job.GetenvList("DnsSearch"); DnsSearch != nil {
+		hostConfig.DnsSearch = DnsSearch
+	}
+	if VolumesFrom := job.GetenvList("VolumesFrom"); VolumesFrom != nil {
+		hostConfig.VolumesFrom = VolumesFrom
+	}
 	return hostConfig
 }

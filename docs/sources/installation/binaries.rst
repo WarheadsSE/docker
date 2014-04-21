@@ -28,6 +28,7 @@ To run properly, docker needs the following software to be installed at runtime:
 
 - iptables version 1.4 or later
 - Git version 1.7 or later
+- procps (or similar provider of a "ps" executable)
 - XZ Utils 4.9 or later
 - a `properly mounted
   <https://github.com/tianon/cgroupfs-mount/blob/master/cgroupfs-mount>`_
@@ -43,6 +44,9 @@ Check kernel dependencies
 Docker in daemon mode has specific kernel requirements. For details,
 check your distribution in :ref:`installation_list`.
 
+In general, a 3.8 Linux kernel (or higher) is preferred, as some of the 
+prior versions have known issues that are triggered by Docker.
+
 Note that Docker also has a client mode, which can run on virtually
 any Linux kernel (it even builds on OSX!).
 
@@ -55,6 +59,9 @@ Get the docker binary:
     wget https://get.docker.io/builds/Linux/x86_64/docker-latest -O docker
     chmod +x docker
 
+.. note::
+    If you have trouble downloading the binary, you can also get the smaller
+    compressed release file: https://get.docker.io/builds/Linux/x86_64/docker-latest.tgz
 
 Run the docker daemon
 ---------------------

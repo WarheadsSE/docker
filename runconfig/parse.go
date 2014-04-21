@@ -4,10 +4,8 @@ import (
 	"fmt"
 	"github.com/dotcloud/docker/nat"
 	"github.com/dotcloud/docker/opts"
-	"github.com/dotcloud/docker/pkg/label"
 	flag "github.com/dotcloud/docker/pkg/mflag"
 	"github.com/dotcloud/docker/pkg/sysinfo"
-	"github.com/dotcloud/docker/runtime/execdriver"
 	"github.com/dotcloud/docker/utils"
 	"io/ioutil"
 	"path"
@@ -35,10 +33,6 @@ func ParseSubcommand(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo)
 
 func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Config, *HostConfig, *flag.FlagSet, error) {
 	var (
-		processLabel string
-		mountLabel   string
-	)
-	var (
 		// FIXME: use utils.ListOpts for attach and volumes?
 		flAttach  = opts.NewListOpts(opts.ValidateAttach)
 		flVolumes = opts.NewListOpts(opts.ValidatePath)
@@ -51,7 +45,7 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		flDnsSearch   = opts.NewListOpts(opts.ValidateDomain)
 		flVolumesFrom opts.ListOpts
 		flLxcOpts     opts.ListOpts
-		flDriverOpts  opts.ListOpts
+		flEnvFile     opts.ListOpts
 
 		flAutoRemove      = cmd.Bool([]string{"#rm", "-rm"}, false, "Automatically remove the container when it exits (incompatible with -d)")
 		flDetach          = cmd.Bool([]string{"d", "-detach"}, false, "Detached mode: Run container in the background, print new container id")
@@ -67,7 +61,6 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		flUser            = cmd.String([]string{"u", "-user"}, "", "Username or UID")
 		flWorkingDir      = cmd.String([]string{"w", "-workdir"}, "", "Working directory inside the container")
 		flCpuShares       = cmd.Int64([]string{"c", "-cpu-shares"}, 0, "CPU shares (relative weight)")
-		flLabelOptions    = cmd.String([]string{"Z", "-label"}, "", "Options to pass to underlying labeling system")
 
 		// For documentation purpose
 		_ = cmd.Bool([]string{"#sig-proxy", "-sig-proxy"}, true, "Proxify all received signal to the process (even in non-tty mode)")
@@ -78,14 +71,14 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 	cmd.Var(&flVolumes, []string{"v", "-volume"}, "Bind mount a volume (e.g. from the host: -v /host:/container, from docker: -v /container)")
 	cmd.Var(&flLinks, []string{"#link", "-link"}, "Add link to another container (name:alias)")
 	cmd.Var(&flEnv, []string{"e", "-env"}, "Set environment variables")
+	cmd.Var(&flEnvFile, []string{"-env-file"}, "Read in a line delimited file of ENV variables")
 
 	cmd.Var(&flPublish, []string{"p", "-publish"}, fmt.Sprintf("Publish a container's port to the host (format: %s) (use 'docker port' to see the actual mapping)", nat.PortSpecTemplateFormat))
 	cmd.Var(&flExpose, []string{"#expose", "-expose"}, "Expose a port from the container without publishing it to your host")
 	cmd.Var(&flDns, []string{"#dns", "-dns"}, "Set custom dns servers")
 	cmd.Var(&flDnsSearch, []string{"-dns-search"}, "Set custom dns search domains")
 	cmd.Var(&flVolumesFrom, []string{"#volumes-from", "-volumes-from"}, "Mount volumes from the specified container(s)")
-	cmd.Var(&flLxcOpts, []string{"#lxc-conf", "#-lxc-conf"}, "(lxc exec-driver only) Add custom lxc options --lxc-conf=\"lxc.cgroup.cpuset.cpus = 0,1\"")
-	cmd.Var(&flDriverOpts, []string{"o", "-opt"}, "Add custom driver options")
+	cmd.Var(&flLxcOpts, []string{"#lxc-conf", "-lxc-conf"}, "(lxc exec-driver only) Add custom lxc options --lxc-conf=\"lxc.cgroup.cpuset.cpus = 0,1\"")
 
 	if err := cmd.Parse(args); err != nil {
 		return nil, nil, cmd, err
@@ -159,15 +152,6 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		entrypoint = []string{*flEntrypoint}
 	}
 
-	if !*flPrivileged {
-		pLabel, mLabel, e := label.GenLabels(*flLabelOptions)
-		if e != nil {
-			return nil, nil, cmd, fmt.Errorf("Invalid security labels : %s", e)
-		}
-		processLabel = pLabel
-		mountLabel = mLabel
-	}
-
 	lxcConf, err := parseKeyValueOpts(flLxcOpts)
 	if err != nil {
 		return nil, nil, cmd, err
@@ -199,6 +183,20 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		}
 	}
 
+	// collect all the environment variables for the container
+	envVariables := []string{}
+	for _, ef := range flEnvFile.GetAll() {
+		parsedVars, err := opts.ParseEnvFile(ef)
+		if err != nil {
+			return nil, nil, cmd, err
+		}
+		envVariables = append(envVariables, parsedVars...)
+	}
+	// parse the '-e' and '--env' after, to allow override
+	envVariables = append(envVariables, flEnv.GetAll()...)
+	// boo, there's no debug output for docker run
+	//utils.Debugf("Environment variables for the container: %#v", envVariables)
+
 	config := &Config{
 		Hostname:        hostname,
 		Domainname:      domainname,
@@ -213,24 +211,12 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		AttachStdin:     flAttach.Get("stdin"),
 		AttachStdout:    flAttach.Get("stdout"),
 		AttachStderr:    flAttach.Get("stderr"),
-		Env:             flEnv.GetAll(),
+		Env:             envVariables,
 		Cmd:             runCmd,
-		Dns:             flDns.GetAll(),
-		DnsSearch:       flDnsSearch.GetAll(),
 		Image:           image,
 		Volumes:         flVolumes.GetMap(),
-		VolumesFrom:     strings.Join(flVolumesFrom.GetAll(), ","),
 		Entrypoint:      entrypoint,
 		WorkingDir:      *flWorkingDir,
-		Context: execdriver.Context{
-			"mount_label":   mountLabel,
-			"process_label": processLabel,
-		},
-	}
-
-	driverOptions, err := parseDriverOpts(flDriverOpts)
-	if err != nil {
-		return nil, nil, cmd, err
 	}
 
 	hostConfig := &HostConfig{
@@ -241,7 +227,9 @@ func parseRun(cmd *flag.FlagSet, args []string, sysInfo *sysinfo.SysInfo) (*Conf
 		PortBindings:    portBindings,
 		Links:           flLinks.GetAll(),
 		PublishAllPorts: *flPublishAll,
-		DriverOptions:   driverOptions,
+		Dns:             flDns.GetAll(),
+		DnsSearch:       flDnsSearch.GetAll(),
+		VolumesFrom:     flVolumesFrom.GetAll(),
 	}
 
 	if sysInfo != nil && flMemory > 0 && !sysInfo.SwapLimit {
@@ -263,6 +251,8 @@ func parseDriverOpts(opts opts.ListOpts) (map[string][]string, error) {
 		parts := strings.SplitN(o, ".", 2)
 		if len(parts) < 2 {
 			return nil, fmt.Errorf("invalid opt format %s", o)
+		} else if strings.TrimSpace(parts[0]) == "" {
+			return nil, fmt.Errorf("key cannot be empty %s", o)
 		}
 		values, exists := out[parts[0]]
 		if !exists {

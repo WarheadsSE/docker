@@ -3,13 +3,14 @@
 package nsinit
 
 import (
+	"os"
+	"os/exec"
+	"syscall"
+
 	"github.com/dotcloud/docker/pkg/cgroups"
 	"github.com/dotcloud/docker/pkg/libcontainer"
 	"github.com/dotcloud/docker/pkg/libcontainer/network"
 	"github.com/dotcloud/docker/pkg/system"
-	"os"
-	"os/exec"
-	"syscall"
 )
 
 // Exec performes setup outside of a namespace so that a container can be
@@ -49,8 +50,13 @@ func (ns *linuxNs) Exec(container *libcontainer.Container, term Terminal, args [
 	if err := command.Start(); err != nil {
 		return -1, err
 	}
+
+	started, err := system.GetProcessStartTime(command.Process.Pid)
+	if err != nil {
+		return -1, err
+	}
 	ns.logger.Printf("writting pid %d to file\n", command.Process.Pid)
-	if err := ns.stateWriter.WritePid(command.Process.Pid); err != nil {
+	if err := ns.stateWriter.WritePid(command.Process.Pid, started); err != nil {
 		command.Process.Kill()
 		return -1, err
 	}

@@ -2,7 +2,7 @@ package cgroups
 
 import (
 	"bufio"
-	"fmt"
+	"errors"
 	"github.com/dotcloud/docker/pkg/mount"
 	"io"
 	"io/ioutil"
@@ -11,14 +11,19 @@ import (
 	"strings"
 )
 
+var (
+	ErrNotFound = errors.New("mountpoint not found")
+)
+
 type Cgroup struct {
 	Name   string `json:"name,omitempty"`
 	Parent string `json:"parent,omitempty"`
 
-	DeviceAccess bool  `json:"device_access,omitempty"` // name of parent cgroup or slice
-	Memory       int64 `json:"memory,omitempty"`        // Memory limit (in bytes)
-	MemorySwap   int64 `json:"memory_swap,omitempty"`   // Total memory usage (memory + swap); set `-1' to disable swap
-	CpuShares    int64 `json:"cpu_shares,omitempty"`    // CPU shares (relative weight vs. other containers)
+	DeviceAccess bool   `json:"device_access,omitempty"` // name of parent cgroup or slice
+	Memory       int64  `json:"memory,omitempty"`        // Memory limit (in bytes)
+	MemorySwap   int64  `json:"memory_swap,omitempty"`   // Total memory usage (memory + swap); set `-1' to disable swap
+	CpuShares    int64  `json:"cpu_shares,omitempty"`    // CPU shares (relative weight vs. other containers)
+	CpusetCpus   string `json:"cpuset_cpus,omitempty"`   // CPU to use
 
 	UnitProperties [][2]string `json:"unit_properties,omitempty"` // systemd unit properties
 }
@@ -43,7 +48,7 @@ func FindCgroupMountpoint(subsystem string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("cgroup mountpoint not found for %s", subsystem)
+	return "", ErrNotFound
 }
 
 // Returns the relative path to the cgroup docker is running in.
@@ -81,7 +86,7 @@ func parseCgroupFile(subsystem string, r io.Reader) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("cgroup '%s' not found in /proc/self/cgroup", subsystem)
+	return "", ErrNotFound
 }
 
 func writeFile(dir, file, data string) error {

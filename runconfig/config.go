@@ -1,10 +1,8 @@
 package runconfig
 
 import (
-	"encoding/json"
 	"github.com/dotcloud/docker/engine"
 	"github.com/dotcloud/docker/nat"
-	"github.com/dotcloud/docker/runtime/execdriver"
 )
 
 // Note: the Config structure should hold only portable information about the container.
@@ -27,26 +25,15 @@ type Config struct {
 	StdinOnce       bool // If true, close stdin after the 1 attached client disconnects.
 	Env             []string
 	Cmd             []string
-	Dns             []string
-	DnsSearch       []string
 	Image           string // Name of the image as it was passed by the operator (eg. could be symbolic)
 	Volumes         map[string]struct{}
-	VolumesFrom     string
 	WorkingDir      string
 	Entrypoint      []string
 	NetworkDisabled bool
 	OnBuild         []string
-	Context         execdriver.Context
 }
 
 func ContainerConfigFromJob(job *engine.Job) *Config {
-	var context execdriver.Context
-	val := job.Getenv("Context")
-	if val != "" {
-		if err := json.Unmarshal([]byte(val), &context); err != nil {
-			panic(err)
-		}
-	}
 	config := &Config{
 		Hostname:        job.Getenv("Hostname"),
 		Domainname:      job.Getenv("Domainname"),
@@ -61,10 +48,8 @@ func ContainerConfigFromJob(job *engine.Job) *Config {
 		OpenStdin:       job.GetenvBool("OpenStdin"),
 		StdinOnce:       job.GetenvBool("StdinOnce"),
 		Image:           job.Getenv("Image"),
-		VolumesFrom:     job.Getenv("VolumesFrom"),
 		WorkingDir:      job.Getenv("WorkingDir"),
 		NetworkDisabled: job.GetenvBool("NetworkDisabled"),
-		Context:         context,
 	}
 	job.GetenvJson("ExposedPorts", &config.ExposedPorts)
 	job.GetenvJson("Volumes", &config.Volumes)
@@ -77,15 +62,8 @@ func ContainerConfigFromJob(job *engine.Job) *Config {
 	if Cmd := job.GetenvList("Cmd"); Cmd != nil {
 		config.Cmd = Cmd
 	}
-	if Dns := job.GetenvList("Dns"); Dns != nil {
-		config.Dns = Dns
-	}
-	if DnsSearch := job.GetenvList("DnsSearch"); DnsSearch != nil {
-		config.DnsSearch = DnsSearch
-	}
 	if Entrypoint := job.GetenvList("Entrypoint"); Entrypoint != nil {
 		config.Entrypoint = Entrypoint
 	}
-
 	return config
 }

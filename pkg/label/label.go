@@ -6,7 +6,7 @@ func GenLabels(options string) (string, string, error) {
 	return "", "", nil
 }
 
-func FormatMountLabel(src string, MountLabel string) string {
+func FormatMountLabel(src string, mountLabel string) string {
 	return src
 }
 
@@ -20,4 +20,7 @@ func SetFileLabel(path string, fileLabel string) error {
 
 func GetPidCon(pid int) (string, error) {
 	return "", nil
+}
+
+func Init() {
 }
