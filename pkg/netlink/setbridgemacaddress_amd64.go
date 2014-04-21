@@ -14,7 +14,7 @@ func setBridgeMacAddress(s int, name string) error {
 	copy(ifr.IfrnName[:], name)
 
 	for i := 0; i < 6; i++ {
-		ifr.IfruHwaddr.Data[i] = int8(rand.Intn(255))
+		ifr.IfruHwaddr.Data[i] = int8(rand.Intn(128))
 	}
 
 	ifr.IfruHwaddr.Data[0] &^= 0x1 // clear multicast bit
