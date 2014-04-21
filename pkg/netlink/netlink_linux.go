@@ -5,7 +5,6 @@ package netlink
 import (
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"syscall"
 	"unsafe"
@@ -869,23 +868,5 @@ func AddToBridge(iface, master *net.Interface) error {
 		return err
 	}
 
-	return nil
-}
-
-func setBridgeMacAddress(s int, name string) error {
-	ifr := ifreqHwaddr{}
-	ifr.IfruHwaddr.Family = syscall.ARPHRD_ETHER
-	copy(ifr.IfrnName[:], name)
-
-	for i := 0; i < 6; i++ {
-		ifr.IfruHwaddr.Data[i] = int8(rand.Intn(255))
-	}
-
-	ifr.IfruHwaddr.Data[0] &^= 0x1 // clear multicast bit
-	ifr.IfruHwaddr.Data[0] |= 0x2  // set local assignment bit (IEEE802)
-
-	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(s), syscall.SIOCSIFHWADDR, uintptr(unsafe.Pointer(&ifr))); err != 0 {
-		return err
-	}
 	return nil
 }
