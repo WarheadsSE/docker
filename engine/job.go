@@ -72,6 +72,9 @@ func (job *Job) Run() error {
 	if err := job.Stderr.Close(); err != nil {
 		return err
 	}
+	if err := job.Stdin.Close(); err != nil {
+		return err
+	}
 	if job.status != 0 {
 		return fmt.Errorf("%s", errorMessage)
 	}
@@ -207,4 +210,8 @@ func (job *Job) Errorf(format string, args ...interface{}) Status {
 func (job *Job) Error(err error) Status {
 	fmt.Fprintf(job.Stderr, "%s\n", err)
 	return StatusErr
+}
+
+func (job *Job) StatusCode() int {
+	return int(job.status)
 }

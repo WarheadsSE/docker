@@ -13,7 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	goruntime "runtime"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -359,7 +359,7 @@ func (cli *DockerCli) CmdVersion(args ...string) error {
 		fmt.Fprintf(cli.out, "Client version: %s\n", dockerversion.VERSION)
 	}
 	fmt.Fprintf(cli.out, "Client API version: %s\n", api.APIVERSION)
-	fmt.Fprintf(cli.out, "Go version (client): %s\n", goruntime.Version())
+	fmt.Fprintf(cli.out, "Go version (client): %s\n", runtime.Version())
 	if dockerversion.GITCOMMIT != "" {
 		fmt.Fprintf(cli.out, "Git commit (client): %s\n", dockerversion.GITCOMMIT)
 	}
@@ -1583,6 +1583,7 @@ func (cli *DockerCli) CmdDiff(args ...string) error {
 func (cli *DockerCli) CmdLogs(args ...string) error {
 	cmd := cli.Subcmd("logs", "CONTAINER", "Fetch the logs of a container")
 	follow := cmd.Bool([]string{"f", "-follow"}, false, "Follow log output")
+	times := cmd.Bool([]string{"t", "-timestamps"}, false, "Show timestamps")
 	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
@@ -1603,14 +1604,16 @@ func (cli *DockerCli) CmdLogs(args ...string) error {
 	}
 
 	v := url.Values{}
-	v.Set("logs", "1")
 	v.Set("stdout", "1")
 	v.Set("stderr", "1")
+	if *times {
+		v.Set("timestamps", "1")
+	}
 	if *follow && container.State.Running {
-		v.Set("stream", "1")
+		v.Set("follow", "1")
 	}
 
-	if err := cli.hijack("POST", "/containers/"+name+"/attach?"+v.Encode(), container.Config.Tty, nil, cli.out, cli.err, nil); err != nil {
+	if err := cli.streamHelper("GET", "/containers/"+name+"/logs?"+v.Encode(), container.Config.Tty, nil, cli.out, cli.err, nil); err != nil {
 		return err
 	}
 	return nil
