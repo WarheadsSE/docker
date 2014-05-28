@@ -7,10 +7,10 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/dotcloud/docker/pkg/cgroups"
-	"github.com/dotcloud/docker/pkg/cgroups/fs"
-	"github.com/dotcloud/docker/pkg/cgroups/systemd"
 	"github.com/dotcloud/docker/pkg/libcontainer"
+	"github.com/dotcloud/docker/pkg/libcontainer/cgroups"
+	"github.com/dotcloud/docker/pkg/libcontainer/cgroups/fs"
+	"github.com/dotcloud/docker/pkg/libcontainer/cgroups/systemd"
 	"github.com/dotcloud/docker/pkg/libcontainer/network"
 	"github.com/dotcloud/docker/pkg/system"
 )
@@ -40,6 +40,7 @@ func Exec(container *libcontainer.Container, term Terminal, rootfs, dataPath str
 	}
 
 	command := createCommand(container, console, rootfs, dataPath, os.Args[0], syncPipe.child, args)
+
 	if err := term.Attach(command); err != nil {
 		return -1, err
 	}
@@ -55,6 +56,7 @@ func Exec(container *libcontainer.Container, term Terminal, rootfs, dataPath str
 	}
 	if err := WritePid(dataPath, command.Process.Pid, started); err != nil {
 		command.Process.Kill()
+		command.Wait()
 		return -1, err
 	}
 	defer DeletePid(dataPath)
@@ -64,6 +66,7 @@ func Exec(container *libcontainer.Container, term Terminal, rootfs, dataPath str
 	cleaner, err := SetupCgroups(container, command.Process.Pid)
 	if err != nil {
 		command.Process.Kill()
+		command.Wait()
 		return -1, err
 	}
 	if cleaner != nil {
@@ -72,6 +75,7 @@ func Exec(container *libcontainer.Container, term Terminal, rootfs, dataPath str
 
 	if err := InitializeNetworking(container, command.Process.Pid, syncPipe); err != nil {
 		command.Process.Kill()
+		command.Wait()
 		return -1, err
 	}
 
@@ -123,6 +127,7 @@ func DefaultCreateCommand(container *libcontainer.Container, console, rootfs, da
 	command.Env = append(os.Environ(), env...)
 
 	system.SetCloneFlags(command, uintptr(GetNamespaceFlags(container.Namespaces)))
+	command.SysProcAttr.Pdeathsig = syscall.SIGKILL
 	command.ExtraFiles = []*os.File{pipe}
 
 	return command

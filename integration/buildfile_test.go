@@ -1,19 +1,22 @@
 package docker
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"github.com/dotcloud/docker/archive"
-	"github.com/dotcloud/docker/engine"
-	"github.com/dotcloud/docker/image"
-	"github.com/dotcloud/docker/nat"
-	"github.com/dotcloud/docker/server"
-	"github.com/dotcloud/docker/utils"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/dotcloud/docker/archive"
+	"github.com/dotcloud/docker/engine"
+	"github.com/dotcloud/docker/image"
+	"github.com/dotcloud/docker/nat"
+	"github.com/dotcloud/docker/server"
+	"github.com/dotcloud/docker/utils"
 )
 
 // A testContextTemplate describes a build context and how to test it
@@ -394,153 +397,21 @@ func buildImage(context testContextTemplate, t *testing.T, eng *engine.Engine, u
 	}
 	dockerfile := constructDockerfile(context.dockerfile, ip, port)
 
-	buildfile := server.NewBuildFile(srv, ioutil.Discard, ioutil.Discard, false, useCache, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
+	buildfile := server.NewBuildFile(srv, ioutil.Discard, ioutil.Discard, false, useCache, false, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
 	id, err := buildfile.Build(context.Archive(dockerfile, t))
 	if err != nil {
 		return nil, err
 	}
 
-	return srv.ImageInspect(id)
-}
-
-func TestVolume(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        volume /test
-        cmd Hello world
-    `, nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
+	job := eng.Job("image_inspect", id)
+	buffer := bytes.NewBuffer(nil)
+	image := &image.Image{}
+	job.Stdout.Add(buffer)
+	if err := job.Run(); err != nil {
+		return nil, err
 	}
-
-	if len(img.Config.Volumes) == 0 {
-		t.Fail()
-	}
-	for key := range img.Config.Volumes {
-		if key != "/test" {
-			t.Fail()
-		}
-	}
-}
-
-func TestBuildMaintainer(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        maintainer dockerio
-    `, nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if img.Author != "dockerio" {
-		t.Fail()
-	}
-}
-
-func TestBuildUser(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        user dockerio
-    `, nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if img.Config.User != "dockerio" {
-		t.Fail()
-	}
-}
-
-func TestBuildRelativeWorkdir(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-		FROM {IMAGE}
-		RUN [ "$PWD" = '/' ]
-		WORKDIR test1
-		RUN [ "$PWD" = '/test1' ]
-		WORKDIR /test2
-		RUN [ "$PWD" = '/test2' ]
-		WORKDIR test3
-		RUN [ "$PWD" = '/test2/test3' ]
-	`, nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if img.Config.WorkingDir != "/test2/test3" {
-		t.Fatalf("Expected workdir to be '/test2/test3', received '%s'", img.Config.WorkingDir)
-	}
-}
-
-func TestBuildEnv(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        env port 4243
-        `,
-		nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	hasEnv := false
-	for _, envVar := range img.Config.Env {
-		if envVar == "port=4243" {
-			hasEnv = true
-			break
-		}
-	}
-	if !hasEnv {
-		t.Fail()
-	}
-}
-
-func TestBuildCmd(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        cmd ["/bin/echo", "Hello World"]
-        `,
-		nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if img.Config.Cmd[0] != "/bin/echo" {
-		t.Log(img.Config.Cmd[0])
-		t.Fail()
-	}
-	if img.Config.Cmd[1] != "Hello World" {
-		t.Log(img.Config.Cmd[1])
-		t.Fail()
-	}
-}
-
-func TestBuildExpose(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        expose 4243
-        `,
-		nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, exists := img.Config.ExposedPorts[nat.NewPort("tcp", "4243")]; !exists {
-		t.Fail()
-	}
-}
-
-func TestBuildEntrypoint(t *testing.T) {
-	img, err := buildImage(testContextTemplate{`
-        from {IMAGE}
-        entrypoint ["/bin/echo"]
-        `,
-		nil, nil}, t, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if img.Config.Entrypoint[0] != "/bin/echo" {
-		t.Log(img.Config.Entrypoint[0])
-		t.Fail()
-	}
+	err = json.NewDecoder(buffer).Decode(image)
+	return image, err
 }
 
 // testing #1405 - config.Cmd does not get cleaned up if
@@ -828,7 +699,7 @@ func TestForbiddenContextPath(t *testing.T) {
 	}
 	dockerfile := constructDockerfile(context.dockerfile, ip, port)
 
-	buildfile := server.NewBuildFile(srv, ioutil.Discard, ioutil.Discard, false, true, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
+	buildfile := server.NewBuildFile(srv, ioutil.Discard, ioutil.Discard, false, true, false, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
 	_, err = buildfile.Build(context.Archive(dockerfile, t))
 
 	if err == nil {
@@ -874,7 +745,7 @@ func TestBuildADDFileNotFound(t *testing.T) {
 	}
 	dockerfile := constructDockerfile(context.dockerfile, ip, port)
 
-	buildfile := server.NewBuildFile(mkServerFromEngine(eng, t), ioutil.Discard, ioutil.Discard, false, true, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
+	buildfile := server.NewBuildFile(mkServerFromEngine(eng, t), ioutil.Discard, ioutil.Discard, false, true, false, false, ioutil.Discard, utils.NewStreamFormatter(false), nil, nil)
 	_, err = buildfile.Build(context.Archive(dockerfile, t))
 
 	if err == nil {

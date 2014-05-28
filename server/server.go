@@ -41,7 +41,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dotcloud/docker/api"
 	"github.com/dotcloud/docker/archive"
 	"github.com/dotcloud/docker/daemon"
 	"github.com/dotcloud/docker/daemonconfig"
@@ -55,6 +54,17 @@ import (
 	"github.com/dotcloud/docker/runconfig"
 	"github.com/dotcloud/docker/utils"
 )
+
+func (srv *Server) handlerWrap(h engine.Handler) engine.Handler {
+	return func(job *engine.Job) engine.Status {
+		if !srv.IsRunning() {
+			return job.Errorf("Server is not running")
+		}
+		srv.tasks.Add(1)
+		defer srv.tasks.Done()
+		return h(job)
+	}
+}
 
 // jobInitApi runs the remote api server `srv` as a daemon,
 // Only one api server can run at the same time - this is enforced by a pidfile.
@@ -128,18 +138,16 @@ func InitServer(job *engine.Job) engine.Status {
 		"logs":             srv.ContainerLogs,
 		"changes":          srv.ContainerChanges,
 		"top":              srv.ContainerTop,
-		"version":          srv.DockerVersion,
 		"load":             srv.ImageLoad,
 		"build":            srv.Build,
 		"pull":             srv.ImagePull,
 		"import":           srv.ImageImport,
 		"image_delete":     srv.ImageDelete,
-		"inspect":          srv.JobInspect,
 		"events":           srv.Events,
 		"push":             srv.ImagePush,
 		"containers":       srv.Containers,
 	} {
-		if err := job.Eng.Register(name, handler); err != nil {
+		if err := job.Eng.Register(name, srv.handlerWrap(handler)); err != nil {
 			return job.Error(err)
 		}
 	}
@@ -148,6 +156,12 @@ func InitServer(job *engine.Job) engine.Status {
 	if err := srv.daemon.Repositories().Install(job.Eng); err != nil {
 		return job.Error(err)
 	}
+	// Install daemon-related commands from the daemon subsystem.
+	// See `daemon/`
+	if err := srv.daemon.Install(job.Eng); err != nil {
+		return job.Error(err)
+	}
+	srv.SetRunning(true)
 	return engine.StatusOK
 }
 
@@ -200,13 +214,22 @@ func (srv *Server) ContainerKill(job *engine.Job) engine.Status {
 	return engine.StatusOK
 }
 
+func (srv *Server) EvictListener(from int64) {
+	srv.Lock()
+	if old, ok := srv.listeners[from]; ok {
+		delete(srv.listeners, from)
+		close(old)
+	}
+	srv.Unlock()
+}
+
 func (srv *Server) Events(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s FROM", job.Name)
+	if len(job.Args) != 0 {
+		return job.Errorf("Usage: %s", job.Name)
 	}
 
 	var (
-		from    = job.Args[0]
+		from    = time.Now().UTC().UnixNano()
 		since   = job.GetenvInt64("since")
 		until   = job.GetenvInt64("until")
 		timeout = time.NewTimer(time.Unix(until, 0).Sub(time.Now()))
@@ -217,15 +240,7 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 			return fmt.Errorf("JSON error")
 		}
 		_, err = job.Stdout.Write(b)
-		if err != nil {
-			// On error, evict the listener
-			utils.Errorf("%s", err)
-			srv.Lock()
-			delete(srv.listeners, from)
-			srv.Unlock()
-			return err
-		}
-		return nil
+		return err
 	}
 
 	listener := make(chan utils.JSONMessage)
@@ -246,8 +261,9 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 					continue
 				}
 				if err != nil {
-					job.Error(err)
-					return engine.StatusErr
+					// On error, evict the listener
+					srv.EvictListener(from)
+					return job.Error(err)
 				}
 			}
 		}
@@ -259,12 +275,17 @@ func (srv *Server) Events(job *engine.Job) engine.Status {
 	}
 	for {
 		select {
-		case event := <-listener:
+		case event, ok := <-listener:
+			if !ok { // Channel is closed: listener was evicted
+				return engine.StatusOK
+			}
 			err := sendEvent(&event)
 			if err != nil && err.Error() == "JSON error" {
 				continue
 			}
 			if err != nil {
+				// On error, evict the listener
+				srv.EvictListener(from)
 				return job.Error(err)
 			}
 		case <-timeout.C:
@@ -322,12 +343,7 @@ func (srv *Server) ImageExport(job *engine.Job) engine.Status {
 	}
 	if rootRepo != nil {
 		for _, id := range rootRepo {
-			image, err := srv.ImageInspect(id)
-			if err != nil {
-				return job.Error(err)
-			}
-
-			if err := srv.exportImage(image, tempdir); err != nil {
+			if err := srv.exportImage(job.Eng, id, tempdir); err != nil {
 				return job.Error(err)
 			}
 		}
@@ -341,11 +357,7 @@ func (srv *Server) ImageExport(job *engine.Job) engine.Status {
 			return job.Error(err)
 		}
 	} else {
-		image, err := srv.ImageInspect(name)
-		if err != nil {
-			return job.Error(err)
-		}
-		if err := srv.exportImage(image, tempdir); err != nil {
+		if err := srv.exportImage(job.Eng, name, tempdir); err != nil {
 			return job.Error(err)
 		}
 	}
@@ -359,13 +371,14 @@ func (srv *Server) ImageExport(job *engine.Job) engine.Status {
 	if _, err := io.Copy(job.Stdout, fs); err != nil {
 		return job.Error(err)
 	}
+	utils.Debugf("End Serializing %s", name)
 	return engine.StatusOK
 }
 
-func (srv *Server) exportImage(img *image.Image, tempdir string) error {
-	for i := img; i != nil; {
+func (srv *Server) exportImage(eng *engine.Engine, name, tempdir string) error {
+	for n := name; n != ""; {
 		// temporary directory
-		tmpImageDir := path.Join(tempdir, i.ID)
+		tmpImageDir := path.Join(tempdir, n)
 		if err := os.Mkdir(tmpImageDir, os.FileMode(0755)); err != nil {
 			if os.IsExist(err) {
 				return nil
@@ -381,44 +394,34 @@ func (srv *Server) exportImage(img *image.Image, tempdir string) error {
 		}
 
 		// serialize json
-		b, err := json.Marshal(i)
+		json, err := os.Create(path.Join(tmpImageDir, "json"))
 		if err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(path.Join(tmpImageDir, "json"), b, os.FileMode(0644)); err != nil {
+		job := eng.Job("image_inspect", n)
+		job.Stdout.Add(json)
+		if err := job.Run(); err != nil {
 			return err
 		}
 
 		// serialize filesystem
-		fs, err := i.TarLayer()
-		if err != nil {
-			return err
-		}
-		defer fs.Close()
-
 		fsTar, err := os.Create(path.Join(tmpImageDir, "layer.tar"))
 		if err != nil {
 			return err
 		}
-		if written, err := io.Copy(fsTar, fs); err != nil {
-			return err
-		} else {
-			utils.Debugf("rendered layer for %s of [%d] size", i.ID, written)
-		}
-
-		if err = fsTar.Close(); err != nil {
+		job = eng.Job("image_tarlayer", n)
+		job.Stdout.Add(fsTar)
+		if err := job.Run(); err != nil {
 			return err
 		}
 
 		// find parent
-		if i.Parent != "" {
-			i, err = srv.ImageInspect(i.Parent)
-			if err != nil {
-				return err
-			}
-		} else {
-			i = nil
+		job = eng.Job("image_get", n)
+		info, _ := job.Stdout.AddEnv()
+		if err := job.Run(); err != nil {
+			return err
 		}
+		n = info.Get("Parent")
 	}
 	return nil
 }
@@ -433,6 +436,7 @@ func (srv *Server) Build(job *engine.Job) engine.Status {
 		suppressOutput = job.GetenvBool("q")
 		noCache        = job.GetenvBool("nocache")
 		rm             = job.GetenvBool("rm")
+		forceRm        = job.GetenvBool("forcerm")
 		authConfig     = &registry.AuthConfig{}
 		configFile     = &registry.ConfigFile{}
 		tag            string
@@ -491,7 +495,7 @@ func (srv *Server) Build(job *engine.Job) engine.Status {
 			Writer:          job.Stdout,
 			StreamFormatter: sf,
 		},
-		!suppressOutput, !noCache, rm, job.Stdout, sf, authConfig, configFile)
+		!suppressOutput, !noCache, rm, forceRm, job.Stdout, sf, authConfig, configFile)
 	id, err := b.Build(context)
 	if err != nil {
 		return job.Error(err)
@@ -543,7 +547,7 @@ func (srv *Server) ImageLoad(job *engine.Job) engine.Status {
 
 	for _, d := range dirs {
 		if d.IsDir() {
-			if err := srv.recursiveLoad(d.Name(), tmpImageDir); err != nil {
+			if err := srv.recursiveLoad(job.Eng, d.Name(), tmpImageDir); err != nil {
 				return job.Error(err)
 			}
 		}
@@ -570,8 +574,8 @@ func (srv *Server) ImageLoad(job *engine.Job) engine.Status {
 	return engine.StatusOK
 }
 
-func (srv *Server) recursiveLoad(address, tmpImageDir string) error {
-	if _, err := srv.ImageInspect(address); err != nil {
+func (srv *Server) recursiveLoad(eng *engine.Engine, address, tmpImageDir string) error {
+	if err := eng.Job("image_get", address).Run(); err != nil {
 		utils.Debugf("Loading %s", address)
 
 		imageJson, err := ioutil.ReadFile(path.Join(tmpImageDir, "repo", address, "json"))
@@ -592,7 +596,7 @@ func (srv *Server) recursiveLoad(address, tmpImageDir string) error {
 		}
 		if img.Parent != "" {
 			if !srv.daemon.Graph().Exists(img.Parent) {
-				if err := srv.recursiveLoad(img.Parent, tmpImageDir); err != nil {
+				if err := srv.recursiveLoad(eng, img.Parent, tmpImageDir); err != nil {
 					return err
 				}
 			}
@@ -801,23 +805,6 @@ func (srv *Server) DockerInfo(job *engine.Job) engine.Status {
 	v.Set("IndexServerAddress", registry.IndexServerAddress())
 	v.Set("InitSha1", dockerversion.INITSHA1)
 	v.Set("InitPath", initPath)
-	if _, err := v.WriteTo(job.Stdout); err != nil {
-		return job.Error(err)
-	}
-	return engine.StatusOK
-}
-
-func (srv *Server) DockerVersion(job *engine.Job) engine.Status {
-	v := &engine.Env{}
-	v.Set("Version", dockerversion.VERSION)
-	v.SetJson("ApiVersion", api.APIVERSION)
-	v.Set("GitCommit", dockerversion.GITCOMMIT)
-	v.Set("GoVersion", runtime.Version())
-	v.Set("Os", runtime.GOOS)
-	v.Set("Arch", runtime.GOARCH)
-	if kernelVersion, err := utils.GetKernelVersion(); err == nil {
-		v.Set("KernelVersion", kernelVersion.String())
-	}
 	if _, err := v.WriteTo(job.Stdout); err != nil {
 		return job.Error(err)
 	}
@@ -1062,8 +1049,12 @@ func (srv *Server) ContainerCommit(job *engine.Job) engine.Status {
 	if container == nil {
 		return job.Errorf("No such container: %s", name)
 	}
-	var config = container.Config
-	var newConfig runconfig.Config
+
+	var (
+		config    = container.Config
+		newConfig runconfig.Config
+	)
+
 	if err := job.GetenvJson("config", &newConfig); err != nil {
 		return job.Error(err)
 	}
@@ -2048,37 +2039,6 @@ func (srv *Server) ImageGetCached(imgID string, config *runconfig.Config) (*imag
 	return match, nil
 }
 
-func (srv *Server) RegisterLinks(container *daemon.Container, hostConfig *runconfig.HostConfig) error {
-	daemon := srv.daemon
-
-	if hostConfig != nil && hostConfig.Links != nil {
-		for _, l := range hostConfig.Links {
-			parts, err := utils.PartParser("name:alias", l)
-			if err != nil {
-				return err
-			}
-			child, err := srv.daemon.GetByName(parts["name"])
-			if err != nil {
-				return err
-			}
-			if child == nil {
-				return fmt.Errorf("Could not get container for %s", parts["name"])
-			}
-			if err := daemon.RegisterLink(container, child, parts["alias"]); err != nil {
-				return err
-			}
-		}
-
-		// After we load all the links into the daemon
-		// set them to nil on the hostconfig
-		hostConfig.Links = nil
-		if err := container.WriteHostConfig(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (srv *Server) ContainerStart(job *engine.Job) engine.Status {
 	if len(job.Args) < 1 {
 		return job.Errorf("Usage: %s container_id", job.Name)
@@ -2119,7 +2079,7 @@ func (srv *Server) ContainerStart(job *engine.Job) engine.Status {
 			}
 		}
 		// Register any links from the host config before starting the container
-		if err := srv.RegisterLinks(container, hostConfig); err != nil {
+		if err := srv.daemon.RegisterLinks(container, hostConfig); err != nil {
 			return job.Error(err)
 		}
 		container.SetHostConfig(hostConfig)
@@ -2380,64 +2340,6 @@ func (srv *Server) ContainerAttach(job *engine.Job) engine.Status {
 	return engine.StatusOK
 }
 
-func (srv *Server) ContainerInspect(name string) (*daemon.Container, error) {
-	if container := srv.daemon.Get(name); container != nil {
-		return container, nil
-	}
-	return nil, fmt.Errorf("No such container: %s", name)
-}
-
-func (srv *Server) ImageInspect(name string) (*image.Image, error) {
-	if image, err := srv.daemon.Repositories().LookupImage(name); err == nil && image != nil {
-		return image, nil
-	}
-	return nil, fmt.Errorf("No such image: %s", name)
-}
-
-func (srv *Server) JobInspect(job *engine.Job) engine.Status {
-	// TODO: deprecate KIND/conflict
-	if n := len(job.Args); n != 2 {
-		return job.Errorf("Usage: %s CONTAINER|IMAGE KIND", job.Name)
-	}
-	var (
-		name                    = job.Args[0]
-		kind                    = job.Args[1]
-		object                  interface{}
-		conflict                = job.GetenvBool("conflict") //should the job detect conflict between containers and images
-		image, errImage         = srv.ImageInspect(name)
-		container, errContainer = srv.ContainerInspect(name)
-	)
-
-	if conflict && image != nil && container != nil {
-		return job.Errorf("Conflict between containers and images")
-	}
-
-	switch kind {
-	case "image":
-		if errImage != nil {
-			return job.Error(errImage)
-		}
-		object = image
-	case "container":
-		if errContainer != nil {
-			return job.Error(errContainer)
-		}
-		object = &struct {
-			*daemon.Container
-			HostConfig *runconfig.HostConfig
-		}{container, container.HostConfig()}
-	default:
-		return job.Errorf("Unknown kind: %s", kind)
-	}
-
-	b, err := json.Marshal(object)
-	if err != nil {
-		return job.Error(err)
-	}
-	job.Stdout.Write(b)
-	return engine.StatusOK
-}
-
 func (srv *Server) ContainerCopy(job *engine.Job) engine.Status {
 	if len(job.Args) != 2 {
 		return job.Errorf("Usage: %s CONTAINER RESOURCE\n", job.Name)
@@ -2475,8 +2377,7 @@ func NewServer(eng *engine.Engine, config *daemonconfig.Config) (*Server, error)
 		pullingPool: make(map[string]chan struct{}),
 		pushingPool: make(map[string]chan struct{}),
 		events:      make([]utils.JSONMessage, 0, 64), //only keeps the 64 last events
-		listeners:   make(map[string]chan utils.JSONMessage),
-		running:     true,
+		listeners:   make(map[int64]chan utils.JSONMessage),
 	}
 	daemon.SetServer(srv)
 	return srv, nil
@@ -2525,6 +2426,16 @@ func (srv *Server) Close() error {
 		return nil
 	}
 	srv.SetRunning(false)
+	done := make(chan struct{})
+	go func() {
+		srv.tasks.Wait()
+		close(done)
+	}()
+	select {
+	// Waiting server jobs for 15 seconds, shutdown immediately after that time
+	case <-time.After(time.Second * 15):
+	case <-done:
+	}
 	if srv.daemon == nil {
 		return nil
 	}
@@ -2537,7 +2448,8 @@ type Server struct {
 	pullingPool map[string]chan struct{}
 	pushingPool map[string]chan struct{}
 	events      []utils.JSONMessage
-	listeners   map[string]chan utils.JSONMessage
+	listeners   map[int64]chan utils.JSONMessage
 	Eng         *engine.Engine
 	running     bool
+	tasks       sync.WaitGroup
 }

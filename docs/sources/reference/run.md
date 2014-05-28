@@ -54,10 +54,10 @@ following options.
      - [Detached (-d)](#detached-d)
      - [Foreground](#foreground)
  - [Container Identification](#container-identification)
-     - [Name (–name)](#name-name)
+     - [Name (--name)](#name-name)
      - [PID Equivalent](#pid-equivalent)
  - [Network Settings](#network-settings)
- - [Clean Up (–rm)](#clean-up-rm)
+ - [Clean Up (--rm)](#clean-up-rm)
  - [Runtime Constraints on CPU and
     Memory](#runtime-constraints-on-cpu-and-memory)
  - [Runtime Privilege and LXC
@@ -136,9 +136,8 @@ PID files):
 
 ## Network Settings
 
-    --dns=[]      : Set custom dns servers for the container
-    --net="bridge": Set the Network mode for the container ('bridge': creates a new network stack for the container on the docker bridge, 'none': no networking for this container, 'container:<name|id>': reuses another container network stack), 'host': use the host network stack inside the container
-    --net="bridge"             Set the Network mode for the container
+    --dns=[]        : Set custom dns servers for the container
+    --net="bridge"  : Set the Network mode for the container
                                  'bridge': creates a new network stack for the container on the docker bridge
                                  'none': no networking for this container
                                  'container:<name|id>': reuses another container network stack
@@ -439,6 +438,8 @@ default user to run the first process with the `Dockerfile USER` command,
 but the operator can override it:
 
     -u="": Username or UID
+
+> **Note:** if you pass numeric uid, it must be in range 0-2147483647.
 
 ## WORKDIR
 

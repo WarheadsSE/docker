@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/dotcloud/docker/daemon/execdriver"
-	"github.com/dotcloud/docker/pkg/cgroups"
 	"github.com/dotcloud/docker/pkg/label"
+	"github.com/dotcloud/docker/pkg/libcontainer/cgroups"
 	"github.com/dotcloud/docker/pkg/system"
 	"github.com/dotcloud/docker/utils"
 )
@@ -167,6 +167,7 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 		waitErr  error
 		waitLock = make(chan struct{})
 	)
+
 	go func() {
 		if err := c.Wait(); err != nil {
 			if _, ok := err.(*exec.ExitError); !ok { // Do not propagate the error if it's simply a status code != 0
@@ -181,9 +182,11 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 	if err != nil {
 		if c.Process != nil {
 			c.Process.Kill()
+			c.Wait()
 		}
 		return -1, err
 	}
+
 	c.ContainerPid = pid
 
 	if startCallback != nil {
@@ -268,18 +271,14 @@ func (d *driver) waitForStart(c *execdriver.Command, waitLock chan struct{}) (in
 		}
 
 		output, err = d.getInfo(c.ID)
-		if err != nil {
-			output, err = d.getInfo(c.ID)
+		if err == nil {
+			info, err := parseLxcInfo(string(output))
 			if err != nil {
 				return -1, err
 			}
-		}
-		info, err := parseLxcInfo(string(output))
-		if err != nil {
-			return -1, err
-		}
-		if info.Running {
-			return info.Pid, nil
+			if info.Running {
+				return info.Pid, nil
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
