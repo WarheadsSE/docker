@@ -158,12 +158,17 @@ func Raw(args ...string) ([]byte, error) {
 	}
 
 	if os.Getenv("DEBUG") != "" {
-		fmt.Printf("[DEBUG] [iptables]: %s, %v\n", path, args)
+		fmt.Fprintf(os.Stderr, fmt.Sprintf("[debug] %s, %v\n", path, args))
 	}
 
 	output, err := exec.Command(path, args...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("iptables failed: iptables %v: %s (%s)", strings.Join(args, " "), output, err)
+	}
+
+	// ignore iptables' message about xtables lock
+	if strings.Contains(string(output), "waiting for it to exit") {
+		output = []byte("")
 	}
 
 	return output, err

@@ -6,13 +6,13 @@ page_keywords: API, Docker, rcli, REST, documentation
 
 ## 1. Brief introduction
 
- - The Remote API has replaced rcli
+ - The Remote API has replaced `rcli`.
  - The daemon listens on `unix:///var/run/docker.sock` but you can
    [*Bind Docker to another host/port or a Unix socket*](
    /use/basics/#bind-docker).
  - The API tends to be REST, but for some complex commands, like `attach`
-   or `pull`, the HTTP connection is hijacked to transport `stdout, stdin`
-   and `stderr`
+   or `pull`, the HTTP connection is hijacked to transport `STDOUT`,
+   `STDIN` and `STDERR`.
 
 # 2. Endpoints
 
@@ -124,12 +124,10 @@ Create a container
              "Cmd":[
                      "date"
              ],
-             "Dns":null,
              "Image":"base",
              "Volumes":{
                      "/tmp": {}
              },
-             "VolumesFrom":"",
              "WorkingDir":"",
              "DisableNetwork": false,
              "ExposedPorts":{
@@ -411,7 +409,9 @@ Start the container `id`
              "LxcConf":{"lxc.utsname":"docker"},
              "PortBindings":{ "22/tcp": [{ "HostPort": "11022" }] },
              "PublishAllPorts":false,
-             "Privileged":false
+             "Privileged":false,
+             "Dns": ["8.8.8.8"],
+             "VolumesFrom": ["parent", "other:ro"]
         }
 
     **Example response**:
@@ -712,6 +712,16 @@ Copy files or folders of container `id`
           }
         ]
 
+
+    Query Parameters:
+
+     
+
+    -   **all** – 1/True/true or 0/False/false, default false
+    -   **filters** – a json encoded value of the filters (a map[string][]string) to process on the images list.
+        
+
+
 ### Create an image
 
 `POST /images/create`
@@ -798,11 +808,9 @@ Return low-level information on the image `name`
         Content-Type: application/json
 
         {
-             "id":"b750fe79269d2ec9a3c593ef05b4332b1d1a02a62b4accb2c21d589ff2f5f2dc",
-             "parent":"27cf784147099545",
-             "created":"2013-03-23T22:24:18.818426-07:00",
-             "container":"3d67245a8d72ecf13f33dffac9f79dcdf70f75acb84d308770391510e0c23ad0",
-             "container_config":
+             "Created":"2013-03-23T22:24:18.818426-07:00",
+             "Container":"3d67245a8d72ecf13f33dffac9f79dcdf70f75acb84d308770391510e0c23ad0",
+             "ContainerConfig":
                      {
                              "Hostname":"",
                              "User":"",
@@ -823,6 +831,8 @@ Return low-level information on the image `name`
                              "VolumesFrom":"",
                              "WorkingDir":""
                      },
+             "Id":"b750fe79269d2ec9a3c593ef05b4332b1d1a02a62b4accb2c21d589ff2f5f2dc",
+             "Parent":"27cf784147099545",
              "Size": 6824592
         }
 
@@ -973,7 +983,7 @@ Remove the image `name` from the filesystem
 
 `GET /images/search`
 
-Search for an image on [Docker.io](https://index.docker.io).
+Search for an image on [Docker Hub](https://hub.docker.com).
 
 > **Note**:
 > The response keys have changed from API v1.6 to reflect the JSON
@@ -992,21 +1002,21 @@ Search for an image on [Docker.io](https://index.docker.io).
                 {
                     "description": "",
                     "is_official": false,
-                    "is_trusted": false,
+                    "is_automated": false,
                     "name": "wma55/u1210sshd",
                     "star_count": 0
                 },
                 {
                     "description": "",
                     "is_official": false,
-                    "is_trusted": false,
+                    "is_automated": false,
                     "name": "jdswinbank/sshd",
                     "star_count": 0
                 },
                 {
                     "description": "",
                     "is_official": false,
-                    "is_trusted": false,
+                    "is_automated": false,
                     "name": "vgauthier/sshd",
                     "star_count": 0
                 }
@@ -1360,4 +1370,4 @@ stdout and stderr on the same socket. This might change in the future.
 To enable cross origin requests to the remote api add the flag
 "–api-enable-cors" when running docker in daemon mode.
 
-    $ docker -d -H="192.168.1.9:4243" --api-enable-cors
+    $ docker -d -H="192.168.1.9:2375" --api-enable-cors

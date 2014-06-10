@@ -9,9 +9,9 @@ import (
 	"github.com/dotcloud/docker/daemon/execdriver"
 	"github.com/dotcloud/docker/daemon/execdriver/native/configuration"
 	"github.com/dotcloud/docker/daemon/execdriver/native/template"
-	"github.com/dotcloud/docker/pkg/apparmor"
 	"github.com/dotcloud/docker/pkg/libcontainer"
-	"github.com/dotcloud/docker/pkg/libcontainer/mount/nodes"
+	"github.com/dotcloud/docker/pkg/libcontainer/apparmor"
+	"github.com/dotcloud/docker/pkg/libcontainer/devices"
 )
 
 // createContainer populates and configures the container type with the
@@ -25,6 +25,8 @@ func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Container
 	container.WorkingDir = c.WorkingDir
 	container.Env = c.Env
 	container.Cgroups.Name = c.ID
+	container.Cgroups.AllowedDevices = c.AllowedDevices
+	container.DeviceNodes = c.AutoCreatedDevices
 	// check to see if we are running in ramdisk to disable pivot root
 	container.NoPivotRoot = os.Getenv("DOCKER_RAMDISK") != ""
 	container.Context["restrictions"] = "true"
@@ -47,9 +49,11 @@ func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Container
 		return nil, err
 	}
 	cmds := make(map[string]*exec.Cmd)
+	d.Lock()
 	for k, v := range d.activeContainers {
 		cmds[k] = v.cmd
 	}
+	d.Unlock()
 	if err := configuration.ParseConfiguration(container, cmds, c.Config["native"]); err != nil {
 		return nil, err
 	}
@@ -86,7 +90,9 @@ func (d *driver) createNetwork(container *libcontainer.Container, c *execdriver.
 	}
 
 	if c.Network.ContainerID != "" {
+		d.Lock()
 		active := d.activeContainers[c.Network.ContainerID]
+		d.Unlock()
 		if active == nil || active.cmd.Process == nil {
 			return fmt.Errorf("%s is not a valid running container to join", c.Network.ContainerID)
 		}
@@ -105,14 +111,15 @@ func (d *driver) createNetwork(container *libcontainer.Container, c *execdriver.
 
 func (d *driver) setPrivileged(container *libcontainer.Container) (err error) {
 	container.Capabilities = libcontainer.GetAllCapabilities()
-	container.Cgroups.DeviceAccess = true
+	container.Cgroups.AllowAllDevices = true
 
-	delete(container.Context, "restrictions")
-
-	container.OptionalDeviceNodes = nil
-	if container.RequiredDeviceNodes, err = nodes.GetHostDeviceNodes(); err != nil {
+	hostDeviceNodes, err := devices.GetHostDeviceNodes()
+	if err != nil {
 		return err
 	}
+	container.DeviceNodes = hostDeviceNodes
+
+	delete(container.Context, "restrictions")
 
 	if apparmor.IsEnabled() {
 		container.Context["apparmor_profile"] = "unconfined"

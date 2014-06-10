@@ -4,29 +4,27 @@ page_keywords: API, Docker, rcli, REST, documentation
 
 # Docker Remote API
 
- - The Remote API is replacing rcli
- - By default the Docker daemon listens on unix:///var/run/docker.sock
-   and the client must have root access to interact with the daemon
- - If a group named *docker* exists on your system, docker will apply
-   ownership of the socket to the group
+ - The Remote API is replacing `rcli`.
+ - By default the Docker daemon listens on `unix:///var/run/docker.sock`
+   and the client must have `root` access to interact with the daemon.
+ - If a group named `docker` exists on your system, docker will apply
+   ownership of the socket to the group.
  - The API tends to be REST, but for some complex commands, like attach
-   or pull, the HTTP connection is hijacked to transport stdout stdin
-   and stderr
+   or pull, the HTTP connection is hijacked to transport STDOUT, STDIN,
+   and STDERR.
  - Since API version 1.2, the auth configuration is now handled client
-   side, so the client has to send the authConfig as POST in /images/(name)/push
+   side, so the client has to send the `authConfig` as a `POST` in `/images/(name)/push`.
  - authConfig, set as the `X-Registry-Auth` header, is currently a Base64
-   encoded (json) string with credentials:
+   encoded (JSON) string with credentials:
    `{'username': string, 'password': string, 'email': string, 'serveraddress' : string}`
-
-
 
 The current version of the API is v1.12
 
-Calling /images/<name>/insert is the same as calling
-/v1.12/images/<name>/insert
+Calling `/images/<name>/insert` is the same as calling
+`/v1.12/images/<name>/insert`.
 
-You can still call an old version of the api using
-/v1.12/images/<name>/insert
+You can still call an old version of the API using
+`/v1.12/images/<name>/insert`.
 
 ## v1.12
 
@@ -36,7 +34,22 @@ You can still call an old version of the api using
 
 ### What's new
 
-docker build now has support for the `forcerm` parameter to always remove containers
+`POST /build`
+
+**New!**
+Build now has support for the `forcerm` parameter to always remove containers
+
+`GET /containers/(name)/json`
+`GET /images/(name)/json`
+
+**New!**
+All the JSON keys are now in CamelCase
+
+**New!**
+Trusted builds are now Automated Builds - `is_trusted` is now `is_automated`.
+
+**Removed Insert Endpoint**
+The `insert` endpoint has been removed.
 
 ## v1.11
 

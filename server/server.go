@@ -27,6 +27,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,6 +55,7 @@ import (
 	"github.com/dotcloud/docker/registry"
 	"github.com/dotcloud/docker/runconfig"
 	"github.com/dotcloud/docker/utils"
+	"github.com/dotcloud/docker/utils/filters"
 )
 
 func (srv *Server) handlerWrap(h engine.Handler) engine.Handler {
@@ -86,17 +89,17 @@ func InitServer(job *engine.Job) engine.Status {
 	c := make(chan os.Signal, 1)
 	gosignal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
-		interruptCount := 0
+		interruptCount := uint32(0)
 		for sig := range c {
-			go func() {
+			go func(sig os.Signal) {
 				log.Printf("Received signal '%v', starting shutdown of docker...\n", sig)
 				switch sig {
 				case os.Interrupt, syscall.SIGTERM:
 					// If the user really wants to interrupt, let him do so.
-					if interruptCount < 3 {
-						interruptCount++
+					if atomic.LoadUint32(&interruptCount) < 3 {
+						atomic.AddUint32(&interruptCount, 1)
 						// Initiate the cleanup only once
-						if interruptCount == 1 {
+						if atomic.LoadUint32(&interruptCount) == 1 {
 							utils.RemovePidFile(srv.daemon.Config().Pidfile)
 							srv.Close()
 						} else {
@@ -108,7 +111,7 @@ func InitServer(job *engine.Job) engine.Status {
 				case syscall.SIGQUIT:
 				}
 				os.Exit(128 + int(sig.(syscall.Signal)))
-			}()
+			}(sig)
 		}
 	}()
 	job.Eng.Hack_SetGlobalVar("httpapi.server", srv)
@@ -122,6 +125,8 @@ func InitServer(job *engine.Job) engine.Status {
 		"restart":          srv.ContainerRestart,
 		"start":            srv.ContainerStart,
 		"kill":             srv.ContainerKill,
+		"pause":            srv.ContainerPause,
+		"unpause":          srv.ContainerUnpause,
 		"wait":             srv.ContainerWait,
 		"tag":              srv.ImageTag, // FIXME merge with "image_tag"
 		"resize":           srv.ContainerResize,
@@ -133,7 +138,6 @@ func InitServer(job *engine.Job) engine.Status {
 		"history":          srv.ImageHistory,
 		"viz":              srv.ImagesViz,
 		"container_copy":   srv.ContainerCopy,
-		"insert":           srv.ImageInsert,
 		"attach":           srv.ContainerAttach,
 		"logs":             srv.ContainerLogs,
 		"changes":          srv.ContainerChanges,
@@ -162,6 +166,36 @@ func InitServer(job *engine.Job) engine.Status {
 		return job.Error(err)
 	}
 	srv.SetRunning(true)
+	return engine.StatusOK
+}
+
+func (srv *Server) ContainerPause(job *engine.Job) engine.Status {
+	if len(job.Args) != 1 {
+		return job.Errorf("Usage: %s CONTAINER", job.Name)
+	}
+	name := job.Args[0]
+	container := srv.daemon.Get(name)
+	if container == nil {
+		return job.Errorf("No such container: %s", name)
+	}
+	if err := container.Pause(); err != nil {
+		return job.Errorf("Cannot pause container %s: %s", name, err)
+	}
+	return engine.StatusOK
+}
+
+func (srv *Server) ContainerUnpause(job *engine.Job) engine.Status {
+	if n := len(job.Args); n < 1 || n > 2 {
+		return job.Errorf("Usage: %s CONTAINER", job.Name)
+	}
+	name := job.Args[0]
+	container := srv.daemon.Get(name)
+	if container == nil {
+		return job.Errorf("No such container: %s", name)
+	}
+	if err := container.Unpause(); err != nil {
+		return job.Errorf("Cannot unpause container %s: %s", name, err)
+	}
 	return engine.StatusOK
 }
 
@@ -610,56 +644,6 @@ func (srv *Server) recursiveLoad(eng *engine.Engine, address, tmpImageDir string
 	return nil
 }
 
-// FIXME: 'insert' is deprecated and should be removed in a future version.
-func (srv *Server) ImageInsert(job *engine.Job) engine.Status {
-	fmt.Fprintf(job.Stderr, "Warning: '%s' is deprecated and will be removed in a future version. Please use 'build' and 'ADD' instead.\n", job.Name)
-	if len(job.Args) != 3 {
-		return job.Errorf("Usage: %s IMAGE URL PATH\n", job.Name)
-	}
-
-	var (
-		name = job.Args[0]
-		url  = job.Args[1]
-		path = job.Args[2]
-	)
-
-	sf := utils.NewStreamFormatter(job.GetenvBool("json"))
-
-	out := utils.NewWriteFlusher(job.Stdout)
-	img, err := srv.daemon.Repositories().LookupImage(name)
-	if err != nil {
-		return job.Error(err)
-	}
-
-	file, err := utils.Download(url)
-	if err != nil {
-		return job.Error(err)
-	}
-	defer file.Body.Close()
-
-	config, _, _, err := runconfig.Parse([]string{img.ID, "echo", "insert", url, path}, srv.daemon.SystemConfig())
-	if err != nil {
-		return job.Error(err)
-	}
-
-	c, _, err := srv.daemon.Create(config, "")
-	if err != nil {
-		return job.Error(err)
-	}
-
-	if err := c.Inject(utils.ProgressReader(file.Body, int(file.ContentLength), out, sf, false, utils.TruncateID(img.ID), "Downloading"), path); err != nil {
-		return job.Error(err)
-	}
-	// FIXME: Handle custom repo, tag comment, author
-	img, err = srv.daemon.Commit(c, "", "", img.Comment, img.Author, nil)
-	if err != nil {
-		out.Write(sf.FormatError(err))
-		return engine.StatusErr
-	}
-	out.Write(sf.FormatStatus("", img.ID))
-	return engine.StatusOK
-}
-
 func (srv *Server) ImagesViz(job *engine.Job) engine.Status {
 	images, _ := srv.daemon.Graph().Map()
 	if images == nil {
@@ -683,15 +667,7 @@ func (srv *Server) ImagesViz(job *engine.Job) engine.Status {
 		}
 	}
 
-	reporefs := make(map[string][]string)
-
-	for name, repository := range srv.daemon.Repositories().Repositories {
-		for tag, id := range repository {
-			reporefs[utils.TruncateID(id)] = append(reporefs[utils.TruncateID(id)], fmt.Sprintf("%s:%s", name, tag))
-		}
-	}
-
-	for id, repos := range reporefs {
+	for id, repos := range srv.daemon.Repositories().GetRepoRefs() {
 		job.Stdout.Write([]byte(" \"" + id + "\" [label=\"" + id + "\\n" + strings.Join(repos, "\\n") + "\",shape=box,fillcolor=\"paleturquoise\",style=\"filled,rounded\"];\n"))
 	}
 	job.Stdout.Write([]byte(" base [style=invisible]\n}\n"))
@@ -700,10 +676,24 @@ func (srv *Server) ImagesViz(job *engine.Job) engine.Status {
 
 func (srv *Server) Images(job *engine.Job) engine.Status {
 	var (
-		allImages map[string]*image.Image
-		err       error
+		allImages   map[string]*image.Image
+		err         error
+		filt_tagged = true
 	)
-	if job.GetenvBool("all") {
+
+	imageFilters, err := filters.FromParam(job.Getenv("filters"))
+	if err != nil {
+		return job.Error(err)
+	}
+	if i, ok := imageFilters["dangling"]; ok {
+		for _, value := range i {
+			if strings.ToLower(value) == "true" {
+				filt_tagged = false
+			}
+		}
+	}
+
+	if job.GetenvBool("all") && filt_tagged {
 		allImages, err = srv.daemon.Graph().Map()
 	} else {
 		allImages, err = srv.daemon.Graph().Heads()
@@ -712,6 +702,7 @@ func (srv *Server) Images(job *engine.Job) engine.Status {
 		return job.Error(err)
 	}
 	lookup := make(map[string]*engine.Env)
+	srv.daemon.Repositories().Lock()
 	for name, repository := range srv.daemon.Repositories().Repositories {
 		if job.Getenv("filter") != "" {
 			if match, _ := path.Match(job.Getenv("filter"), name); !match {
@@ -726,21 +717,27 @@ func (srv *Server) Images(job *engine.Job) engine.Status {
 			}
 
 			if out, exists := lookup[id]; exists {
-				out.SetList("RepoTags", append(out.GetList("RepoTags"), fmt.Sprintf("%s:%s", name, tag)))
+				if filt_tagged {
+					out.SetList("RepoTags", append(out.GetList("RepoTags"), fmt.Sprintf("%s:%s", name, tag)))
+				}
 			} else {
-				out := &engine.Env{}
+				// get the boolean list for if only the untagged images are requested
 				delete(allImages, id)
-				out.Set("ParentId", image.Parent)
-				out.SetList("RepoTags", []string{fmt.Sprintf("%s:%s", name, tag)})
-				out.Set("Id", image.ID)
-				out.SetInt64("Created", image.Created.Unix())
-				out.SetInt64("Size", image.Size)
-				out.SetInt64("VirtualSize", image.GetParentsSize(0)+image.Size)
-				lookup[id] = out
+				if filt_tagged {
+					out := &engine.Env{}
+					out.Set("ParentId", image.Parent)
+					out.SetList("RepoTags", []string{fmt.Sprintf("%s:%s", name, tag)})
+					out.Set("Id", image.ID)
+					out.SetInt64("Created", image.Created.Unix())
+					out.SetInt64("Size", image.Size)
+					out.SetInt64("VirtualSize", image.GetParentsSize(0)+image.Size)
+					lookup[id] = out
+				}
 			}
 
 		}
 	}
+	srv.daemon.Repositories().Unlock()
 
 	outs := engine.NewTable("Created", len(lookup))
 	for _, value := range lookup {
@@ -1099,7 +1096,7 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 
 		// ensure no two downloads of the same layer happen at the same time
 		if c, err := srv.poolAdd("pull", "layer:"+id); err != nil {
-			utils.Errorf("Image (id: %s) pull is already running, skipping: %v", id, err)
+			utils.Debugf("Image (id: %s) pull is already running, skipping: %v", id, err)
 			<-c
 		}
 		defer srv.poolRemove("pull", "layer:"+id)
@@ -1134,17 +1131,38 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 				}
 			}
 
-			// Get the layer
-			out.Write(sf.FormatProgress(utils.TruncateID(id), "Pulling fs layer", nil))
-			layer, err := r.GetRemoteImageLayer(img.ID, endpoint, token)
-			if err != nil {
-				out.Write(sf.FormatProgress(utils.TruncateID(id), "Error pulling dependent layers", nil))
-				return err
-			}
-			defer layer.Close()
-			if err := srv.daemon.Graph().Register(imgJSON, utils.ProgressReader(layer, imgSize, out, sf, false, utils.TruncateID(id), "Downloading"), img); err != nil {
-				out.Write(sf.FormatProgress(utils.TruncateID(id), "Error downloading dependent layers", nil))
-				return err
+			for j := 1; j <= retries; j++ {
+				// Get the layer
+				status := "Pulling fs layer"
+				if j > 1 {
+					status = fmt.Sprintf("Pulling fs layer [retries: %d]", j)
+				}
+				out.Write(sf.FormatProgress(utils.TruncateID(id), status, nil))
+				layer, err := r.GetRemoteImageLayer(img.ID, endpoint, token, int64(imgSize))
+				if uerr, ok := err.(*url.Error); ok {
+					err = uerr.Err
+				}
+				if terr, ok := err.(net.Error); ok && terr.Timeout() && j < retries {
+					time.Sleep(time.Duration(j) * 500 * time.Millisecond)
+					continue
+				} else if err != nil {
+					out.Write(sf.FormatProgress(utils.TruncateID(id), "Error pulling dependent layers", nil))
+					return err
+				}
+				defer layer.Close()
+
+				err = srv.daemon.Graph().Register(imgJSON,
+					utils.ProgressReader(layer, imgSize, out, sf, false, utils.TruncateID(id), "Downloading"),
+					img)
+				if terr, ok := err.(net.Error); ok && terr.Timeout() && j < retries {
+					time.Sleep(time.Duration(j) * 500 * time.Millisecond)
+					continue
+				} else if err != nil {
+					out.Write(sf.FormatProgress(utils.TruncateID(id), "Error downloading dependent layers", nil))
+					return err
+				} else {
+					break
+				}
 			}
 		}
 		out.Write(sf.FormatProgress(utils.TruncateID(id), "Download complete", nil))
@@ -1217,7 +1235,7 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName
 					<-c
 					out.Write(sf.FormatProgress(utils.TruncateID(img.ID), "Download complete", nil))
 				} else {
-					utils.Errorf("Image (id: %s) pull is already running, skipping: %v", img.ID, err)
+					utils.Debugf("Image (id: %s) pull is already running, skipping: %v", img.ID, err)
 				}
 				if parallel {
 					errors <- nil
@@ -1280,9 +1298,6 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName
 		if err := srv.daemon.Repositories().Set(localName, tag, id, true); err != nil {
 			return err
 		}
-	}
-	if err := srv.daemon.Repositories().Save(); err != nil {
-		return err
 	}
 
 	return nil
@@ -1347,7 +1362,7 @@ func (srv *Server) ImagePull(job *engine.Job) engine.Status {
 	}
 
 	job.GetenvJson("authConfig", authConfig)
-	job.GetenvJson("metaHeaders", metaHeaders)
+	job.GetenvJson("metaHeaders", &metaHeaders)
 
 	c, err := srv.poolAdd("pull", localName+":"+tag)
 	if err != nil {
@@ -1372,7 +1387,7 @@ func (srv *Server) ImagePull(job *engine.Job) engine.Status {
 		return job.Error(err)
 	}
 
-	r, err := registry.NewRegistry(authConfig, registry.HTTPRequestFactory(metaHeaders), endpoint)
+	r, err := registry.NewRegistry(authConfig, registry.HTTPRequestFactory(metaHeaders), endpoint, true)
 	if err != nil {
 		return job.Error(err)
 	}
@@ -1577,7 +1592,7 @@ func (srv *Server) ImagePush(job *engine.Job) engine.Status {
 
 	tag := job.Getenv("tag")
 	job.GetenvJson("authConfig", authConfig)
-	job.GetenvJson("metaHeaders", metaHeaders)
+	job.GetenvJson("metaHeaders", &metaHeaders)
 	if _, err := srv.poolAdd("push", localName); err != nil {
 		return job.Error(err)
 	}
@@ -1595,7 +1610,7 @@ func (srv *Server) ImagePush(job *engine.Job) engine.Status {
 	}
 
 	img, err := srv.daemon.Graph().Get(localName)
-	r, err2 := registry.NewRegistry(authConfig, registry.HTTPRequestFactory(metaHeaders), endpoint)
+	r, err2 := registry.NewRegistry(authConfig, registry.HTTPRequestFactory(metaHeaders), endpoint, false)
 	if err2 != nil {
 		return job.Error(err2)
 	}

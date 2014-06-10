@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"container/list"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -27,11 +26,10 @@ import (
 	"github.com/dotcloud/docker/graph"
 	"github.com/dotcloud/docker/image"
 	"github.com/dotcloud/docker/pkg/graphdb"
-	"github.com/dotcloud/docker/pkg/label"
-	"github.com/dotcloud/docker/pkg/mount"
+	"github.com/dotcloud/docker/pkg/libcontainer/label"
+	"github.com/dotcloud/docker/pkg/libcontainer/selinux"
 	"github.com/dotcloud/docker/pkg/namesgenerator"
 	"github.com/dotcloud/docker/pkg/networkfs/resolvconf"
-	"github.com/dotcloud/docker/pkg/selinux"
 	"github.com/dotcloud/docker/pkg/sysinfo"
 	"github.com/dotcloud/docker/runconfig"
 	"github.com/dotcloud/docker/utils"
@@ -48,10 +46,43 @@ var (
 	validContainerNamePattern = regexp.MustCompile(`^/?` + validContainerNameChars + `+$`)
 )
 
+type contStore struct {
+	s map[string]*Container
+	sync.Mutex
+}
+
+func (c *contStore) Add(id string, cont *Container) {
+	c.Lock()
+	c.s[id] = cont
+	c.Unlock()
+}
+
+func (c *contStore) Get(id string) *Container {
+	c.Lock()
+	res := c.s[id]
+	c.Unlock()
+	return res
+}
+
+func (c *contStore) Delete(id string) {
+	c.Lock()
+	delete(c.s, id)
+	c.Unlock()
+}
+
+func (c *contStore) List() []*Container {
+	containers := new(History)
+	for _, cont := range c.s {
+		containers.Add(cont)
+	}
+	containers.Sort()
+	return *containers
+}
+
 type Daemon struct {
 	repository     string
 	sysInitPath    string
-	containers     *list.List
+	containers     *contStore
 	graph          *graph.Graph
 	repositories   *graph.TagStore
 	idIndex        *utils.TruncIndex
@@ -70,39 +101,9 @@ func (daemon *Daemon) Install(eng *engine.Engine) error {
 	return eng.Register("container_inspect", daemon.ContainerInspect)
 }
 
-// Mountpoints should be private to the container
-func remountPrivate(mountPoint string) error {
-	mounted, err := mount.Mounted(mountPoint)
-	if err != nil {
-		return err
-	}
-
-	if !mounted {
-		if err := mount.Mount(mountPoint, mountPoint, "none", "bind,rw"); err != nil {
-			return err
-		}
-	}
-	return mount.ForceMount("", mountPoint, "none", "private")
-}
-
 // List returns an array of all containers registered in the daemon.
 func (daemon *Daemon) List() []*Container {
-	containers := new(History)
-	for e := daemon.containers.Front(); e != nil; e = e.Next() {
-		containers.Add(e.Value.(*Container))
-	}
-	containers.Sort()
-	return *containers
-}
-
-func (daemon *Daemon) getContainerElement(id string) *list.Element {
-	for e := daemon.containers.Front(); e != nil; e = e.Next() {
-		container := e.Value.(*Container)
-		if container.ID == id {
-			return e
-		}
-	}
-	return nil
+	return daemon.containers.List()
 }
 
 // Get looks for a container by the specified ID or name, and returns it.
@@ -117,11 +118,7 @@ func (daemon *Daemon) Get(name string) *Container {
 		return nil
 	}
 
-	e := daemon.getContainerElement(id)
-	if e == nil {
-		return nil
-	}
-	return e.Value.(*Container)
+	return daemon.containers.Get(id)
 }
 
 // Exists returns a true if a container of the specified ID or name exists,
@@ -150,11 +147,11 @@ func (daemon *Daemon) load(id string) (*Container, error) {
 // Register makes a container object usable by the daemon as <container.ID>
 // This is a wrapper for register
 func (daemon *Daemon) Register(container *Container) error {
-	return daemon.register(container, true)
+	return daemon.register(container, true, nil)
 }
 
 // register makes a container object usable by the daemon as <container.ID>
-func (daemon *Daemon) register(container *Container, updateSuffixarray bool) error {
+func (daemon *Daemon) register(container *Container, updateSuffixarray bool, containersToStart *[]*Container) error {
 	if container.daemon != nil || daemon.Exists(container.ID) {
 		return fmt.Errorf("Container is already loaded")
 	}
@@ -177,7 +174,7 @@ func (daemon *Daemon) register(container *Container, updateSuffixarray bool) err
 		container.stdinPipe = utils.NopWriteCloser(ioutil.Discard) // Silently drop stdin
 	}
 	// done
-	daemon.containers.PushBack(container)
+	daemon.containers.Add(container.ID, container)
 
 	// don't update the Suffixarray if we're starting up
 	// we'll waste time if we update it for every container
@@ -223,13 +220,13 @@ func (daemon *Daemon) register(container *Container, updateSuffixarray bool) err
 		if !info.IsRunning() {
 			utils.Debugf("Container %s was supposed to be running but is not.", container.ID)
 			if daemon.config.AutoRestart {
-				utils.Debugf("Restarting")
+				utils.Debugf("Marking as restarting")
 				if err := container.Unmount(); err != nil {
 					utils.Debugf("restart unmount error %s", err)
 				}
 
-				if err := container.Start(); err != nil {
-					return err
+				if containersToStart != nil {
+					*containersToStart = append(*containersToStart, container)
 				}
 			} else {
 				utils.Debugf("Marking as stopped")
@@ -279,7 +276,7 @@ func (daemon *Daemon) Destroy(container *Container) error {
 		return fmt.Errorf("The given container is <nil>")
 	}
 
-	element := daemon.getContainerElement(container.ID)
+	element := daemon.containers.Get(container.ID)
 	if element == nil {
 		return fmt.Errorf("Container %v not found - maybe it was already destroyed?", container.ID)
 	}
@@ -290,7 +287,7 @@ func (daemon *Daemon) Destroy(container *Container) error {
 
 	// Deregister the container before removing its directory, to avoid race conditions
 	daemon.idIndex.Delete(container.ID)
-	daemon.containers.Remove(element)
+	daemon.containers.Delete(container.ID)
 
 	if _, err := daemon.containerGraph.Purge(container.ID); err != nil {
 		utils.Debugf("Unable to remove container from link graph: %s", err)
@@ -314,20 +311,25 @@ func (daemon *Daemon) Destroy(container *Container) error {
 }
 
 func (daemon *Daemon) restore() error {
-	if os.Getenv("DEBUG") == "" && os.Getenv("TEST") == "" {
+	var (
+		debug             = (os.Getenv("DEBUG") != "" || os.Getenv("TEST") != "")
+		containers        = make(map[string]*Container)
+		currentDriver     = daemon.driver.String()
+		containersToStart = []*Container{}
+	)
+
+	if !debug {
 		fmt.Printf("Loading containers: ")
 	}
 	dir, err := ioutil.ReadDir(daemon.repository)
 	if err != nil {
 		return err
 	}
-	containers := make(map[string]*Container)
-	currentDriver := daemon.driver.String()
 
 	for _, v := range dir {
 		id := v.Name()
 		container, err := daemon.load(id)
-		if os.Getenv("DEBUG") == "" && os.Getenv("TEST") == "" {
+		if !debug {
 			fmt.Print(".")
 		}
 		if err != nil {
@@ -344,20 +346,16 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
-	registerContainer := func(container *Container) {
-		if err := daemon.register(container, false); err != nil {
-			utils.Debugf("Failed to register container %s: %s", container.ID, err)
-		}
-	}
-
 	if entities := daemon.containerGraph.List("/", -1); entities != nil {
 		for _, p := range entities.Paths() {
-			if os.Getenv("DEBUG") == "" && os.Getenv("TEST") == "" {
+			if !debug {
 				fmt.Print(".")
 			}
 			e := entities[p]
 			if container, ok := containers[e.ID()]; ok {
-				registerContainer(container)
+				if err := daemon.register(container, false, &containersToStart); err != nil {
+					utils.Debugf("Failed to register container %s: %s", container.ID, err)
+				}
 				delete(containers, e.ID())
 			}
 		}
@@ -370,11 +368,21 @@ func (daemon *Daemon) restore() error {
 		if err != nil {
 			utils.Debugf("Setting default id - %s", err)
 		}
-		registerContainer(container)
+		if err := daemon.register(container, false, &containersToStart); err != nil {
+			utils.Debugf("Failed to register container %s: %s", container.ID, err)
+		}
 	}
 
 	daemon.idIndex.UpdateSuffixarray()
-	if os.Getenv("DEBUG") == "" && os.Getenv("TEST") == "" {
+
+	for _, container := range containersToStart {
+		utils.Debugf("Starting container %d", container.ID)
+		if err := container.Start(); err != nil {
+			utils.Debugf("Failed to start container %s: %s", container.ID, err)
+		}
+	}
+
+	if !debug {
 		fmt.Printf(": done.\n")
 	}
 
@@ -511,7 +519,7 @@ func (daemon *Daemon) reserveName(id, name string) (string, error) {
 
 func (daemon *Daemon) generateNewName(id string) (string, error) {
 	var name string
-	for i := 1; i < 6; i++ {
+	for i := 0; i < 6; i++ {
 		name = namesgenerator.GetRandomName(i)
 		if name[0] != '/' {
 			name = "/" + name
@@ -677,11 +685,11 @@ func (daemon *Daemon) GetByName(name string) (*Container, error) {
 	if entity == nil {
 		return nil, fmt.Errorf("Could not find entity for %s", name)
 	}
-	e := daemon.getContainerElement(entity.ID())
+	e := daemon.containers.Get(entity.ID())
 	if e == nil {
 		return nil, fmt.Errorf("Could not find container for entity id %s", entity.ID())
 	}
-	return e.Value.(*Container), nil
+	return e, nil
 }
 
 func (daemon *Daemon) Children(name string) (map[string]*Container, error) {
@@ -767,15 +775,11 @@ func NewDaemonFromDirectory(config *daemonconfig.Config, eng *engine.Engine) (*D
 	graphdriver.DefaultDriver = config.GraphDriver
 
 	// Load storage driver
-	driver, err := graphdriver.New(config.Root)
+	driver, err := graphdriver.New(config.Root, config.GraphOptions)
 	if err != nil {
 		return nil, err
 	}
 	utils.Debugf("Using graph driver %s", driver)
-
-	if err := remountPrivate(config.Root); err != nil {
-		return nil, err
-	}
 
 	daemonRepo := path.Join(config.Root, "containers")
 
@@ -796,7 +800,7 @@ func NewDaemonFromDirectory(config *daemonconfig.Config, eng *engine.Engine) (*D
 
 	// We don't want to use a complex driver like aufs or devmapper
 	// for volumes, just a plain filesystem
-	volumesDriver, err := graphdriver.GetDriver("vfs", config.Root)
+	volumesDriver, err := graphdriver.GetDriver("vfs", config.Root, config.GraphOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -860,7 +864,7 @@ func NewDaemonFromDirectory(config *daemonconfig.Config, eng *engine.Engine) (*D
 
 	daemon := &Daemon{
 		repository:     daemonRepo,
-		containers:     list.New(),
+		containers:     &contStore{s: make(map[string]*Container)},
 		graph:          g,
 		repositories:   repositories,
 		idIndex:        utils.NewTruncIndex([]string{}),
@@ -923,10 +927,6 @@ func (daemon *Daemon) Close() error {
 	}
 	if err := daemon.containerGraph.Close(); err != nil {
 		utils.Errorf("daemon.containerGraph.Close(): %s", err.Error())
-		errorsStrings = append(errorsStrings, err.Error())
-	}
-	if err := mount.Unmount(daemon.config.Root); err != nil {
-		utils.Errorf("daemon.Umount(%s): %s", daemon.config.Root, err.Error())
 		errorsStrings = append(errorsStrings, err.Error())
 	}
 	if len(errorsStrings) > 0 {
@@ -999,6 +999,22 @@ func (daemon *Daemon) Diff(container *Container) (archive.Archive, error) {
 
 func (daemon *Daemon) Run(c *Container, pipes *execdriver.Pipes, startCallback execdriver.StartCallback) (int, error) {
 	return daemon.execDriver.Run(c.command, pipes, startCallback)
+}
+
+func (daemon *Daemon) Pause(c *Container) error {
+	if err := daemon.execDriver.Pause(c.command); err != nil {
+		return err
+	}
+	c.State.SetPaused()
+	return nil
+}
+
+func (daemon *Daemon) Unpause(c *Container) error {
+	if err := daemon.execDriver.Unpause(c.command); err != nil {
+		return err
+	}
+	c.State.SetUnpaused()
+	return nil
 }
 
 func (daemon *Daemon) Kill(c *Container, sig int) error {

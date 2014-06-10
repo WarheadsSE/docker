@@ -9,14 +9,16 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/dotcloud/docker/daemon/execdriver"
-	"github.com/dotcloud/docker/pkg/label"
 	"github.com/dotcloud/docker/pkg/libcontainer/cgroups"
+	"github.com/dotcloud/docker/pkg/libcontainer/label"
+	"github.com/dotcloud/docker/pkg/libcontainer/mount/nodes"
 	"github.com/dotcloud/docker/pkg/system"
 	"github.com/dotcloud/docker/utils"
 )
@@ -25,6 +27,7 @@ const DriverName = "lxc"
 
 func init() {
 	execdriver.RegisterInitFunc(DriverName, func(args *execdriver.InitArgs) error {
+		runtime.LockOSThread()
 		if err := setupEnv(args); err != nil {
 			return err
 		}
@@ -159,6 +162,10 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 	c.Path = aname
 	c.Args = append([]string{name}, arg...)
 
+	if err := nodes.CreateDeviceNodes(c.Rootfs, c.AutoCreatedDevices); err != nil {
+		return -1, err
+	}
+
 	if err := c.Start(); err != nil {
 		return -1, err
 	}
@@ -209,6 +216,30 @@ func getExitCode(c *execdriver.Command) int {
 
 func (d *driver) Kill(c *execdriver.Command, sig int) error {
 	return KillLxc(c.ID, sig)
+}
+
+func (d *driver) Pause(c *execdriver.Command) error {
+	_, err := exec.LookPath("lxc-freeze")
+	if err == nil {
+		output, errExec := exec.Command("lxc-freeze", "-n", c.ID).CombinedOutput()
+		if errExec != nil {
+			return fmt.Errorf("Err: %s Output: %s", errExec, output)
+		}
+	}
+
+	return err
+}
+
+func (d *driver) Unpause(c *execdriver.Command) error {
+	_, err := exec.LookPath("lxc-unfreeze")
+	if err == nil {
+		output, errExec := exec.Command("lxc-unfreeze", "-n", c.ID).CombinedOutput()
+		if errExec != nil {
+			return fmt.Errorf("Err: %s Output: %s", errExec, output)
+		}
+	}
+
+	return err
 }
 
 func (d *driver) Terminate(c *execdriver.Command) error {

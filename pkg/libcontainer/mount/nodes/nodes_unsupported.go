@@ -2,10 +2,11 @@
 
 package nodes
 
-import "github.com/dotcloud/docker/pkg/libcontainer"
+import (
+	"github.com/dotcloud/docker/pkg/libcontainer"
+	"github.com/dotcloud/docker/pkg/libcontainer/devices"
+)
 
-var DefaultNodes = []string{}
-
-func GetHostDeviceNodes() ([]string, error) {
-	return nil, libcontainer.ErrUnsupported
+func CreateDeviceNodes(rootfs string, nodesToCreate []*devices.Device) error {
+	return libcontainer.ErrUnsupported
 }

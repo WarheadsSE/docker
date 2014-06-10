@@ -22,7 +22,8 @@ import (
 	"github.com/dotcloud/docker/image"
 	"github.com/dotcloud/docker/links"
 	"github.com/dotcloud/docker/nat"
-	"github.com/dotcloud/docker/pkg/label"
+	"github.com/dotcloud/docker/pkg/libcontainer/devices"
+	"github.com/dotcloud/docker/pkg/libcontainer/label"
 	"github.com/dotcloud/docker/pkg/networkfs/etchosts"
 	"github.com/dotcloud/docker/pkg/networkfs/resolvconf"
 	"github.com/dotcloud/docker/pkg/symlink"
@@ -81,42 +82,6 @@ type Container struct {
 	hostConfig *runconfig.HostConfig
 
 	activeLinks map[string]*links.Link
-}
-
-// Inject the io.Reader at the given path. Note: do not close the reader
-func (container *Container) Inject(file io.Reader, pth string) error {
-	if err := container.Mount(); err != nil {
-		return fmt.Errorf("inject: error mounting container %s: %s", container.ID, err)
-	}
-	defer container.Unmount()
-
-	// Return error if path exists
-	destPath := container.getResourcePath(pth)
-	if _, err := os.Stat(destPath); err == nil {
-		// Since err is nil, the path could be stat'd and it exists
-		return fmt.Errorf("%s exists", pth)
-	} else if !os.IsNotExist(err) {
-		// Expect err might be that the file doesn't exist, so
-		// if it's some other error, return that.
-
-		return err
-	}
-
-	// Make sure the directory exists
-	if err := os.MkdirAll(container.getResourcePath(path.Dir(pth)), 0755); err != nil {
-		return err
-	}
-
-	dest, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
-	defer dest.Close()
-
-	if _, err := io.Copy(dest, file); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (container *Container) FromDisk() error {
@@ -230,18 +195,20 @@ func populateCommand(c *Container, env []string) error {
 		Cpuset:     c.Config.Cpuset,
 	}
 	c.command = &execdriver.Command{
-		ID:         c.ID,
-		Privileged: c.hostConfig.Privileged,
-		Rootfs:     c.RootfsPath(),
-		InitPath:   "/.dockerinit",
-		Entrypoint: c.Path,
-		Arguments:  c.Args,
-		WorkingDir: c.Config.WorkingDir,
-		Network:    en,
-		Tty:        c.Config.Tty,
-		User:       c.Config.User,
-		Config:     context,
-		Resources:  resources,
+		ID:                 c.ID,
+		Privileged:         c.hostConfig.Privileged,
+		Rootfs:             c.RootfsPath(),
+		InitPath:           "/.dockerinit",
+		Entrypoint:         c.Path,
+		Arguments:          c.Args,
+		WorkingDir:         c.Config.WorkingDir,
+		Network:            en,
+		Tty:                c.Config.Tty,
+		User:               c.Config.User,
+		Config:             context,
+		Resources:          resources,
+		AllowedDevices:     devices.DefaultAllowedDevices,
+		AutoCreatedDevices: devices.DefaultAutoCreatedDevices,
 	}
 	c.command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	c.command.Env = env
@@ -468,6 +435,20 @@ func (container *Container) monitor(callback execdriver.StartCallback) error {
 		utils.Errorf("Error running container: %s", err)
 	}
 
+	// Cleanup
+	container.cleanup()
+
+	// Re-create a brand new stdin pipe once the container exited
+	if container.Config.OpenStdin {
+		container.stdin, container.stdinPipe = io.Pipe()
+	}
+
+	if container.daemon != nil && container.daemon.srv != nil {
+		container.daemon.srv.LogEvent("die", container.ID, container.daemon.repositories.ImageName(container.Image))
+	}
+
+	close(container.waitLock)
+
 	if container.daemon != nil && container.daemon.srv != nil && container.daemon.srv.IsRunning() {
 		container.State.SetStopped(exitCode)
 
@@ -482,20 +463,6 @@ func (container *Container) monitor(callback execdriver.StartCallback) error {
 			utils.Errorf("Error dumping container state to disk: %s\n", err)
 		}
 	}
-
-	// Cleanup
-	container.cleanup()
-
-	// Re-create a brand new stdin pipe once the container exited
-	if container.Config.OpenStdin {
-		container.stdin, container.stdinPipe = io.Pipe()
-	}
-
-	if container.daemon != nil && container.daemon.srv != nil {
-		container.daemon.srv.LogEvent("die", container.ID, container.daemon.repositories.ImageName(container.Image))
-	}
-
-	close(container.waitLock)
 
 	return err
 }
@@ -535,10 +502,35 @@ func (container *Container) KillSig(sig int) error {
 	container.Lock()
 	defer container.Unlock()
 
+	// We could unpause the container for them rather than returning this error
+	if container.State.IsPaused() {
+		return fmt.Errorf("Container %s is paused. Unpause the container before stopping", container.ID)
+	}
+
 	if !container.State.IsRunning() {
 		return nil
 	}
 	return container.daemon.Kill(container, sig)
+}
+
+func (container *Container) Pause() error {
+	if container.State.IsPaused() {
+		return fmt.Errorf("Container %s is already paused", container.ID)
+	}
+	if !container.State.IsRunning() {
+		return fmt.Errorf("Container %s is not running", container.ID)
+	}
+	return container.daemon.Pause(container)
+}
+
+func (container *Container) Unpause() error {
+	if !container.State.IsPaused() {
+		return fmt.Errorf("Container %s is not paused", container.ID)
+	}
+	if !container.State.IsRunning() {
+		return fmt.Errorf("Container %s is not running", container.ID)
+	}
+	return container.daemon.Unpause(container)
 }
 
 func (container *Container) Kill() error {
